@@ -42,7 +42,6 @@ import logging
 import math
 import os
 import random
-import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -60,6 +59,11 @@ from claude_swap.account_policy import (
     evaluate_account_policy,
     load_policies,
 )
+from claude_swap.autoswitch_files import (
+    STATUS_SCHEMA_VERSION,
+    redact_emails,
+    write_status,
+)
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
@@ -72,7 +76,9 @@ from claude_swap.poll_policy import (
 from claude_swap.settings import (
     AutoSwitchSettings,
     atomic_write_json,
+    load_settings,
     parse_model_names,
+    pause_active,
     settings_path,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -294,6 +300,13 @@ def _now_iso() -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def _pause_detail(paused_until: float | str) -> str:
+    if paused_until == "forever":
+        return "until resumed (cswap auto --resume)"
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(paused_until)))
+    return f"until {stamp} (cswap auto --resume to end early)"
 
 
 def pct_label(value: float) -> str:
@@ -590,6 +603,7 @@ class SettingsReloadedEvent(AutoSwitchEvent):
             "cooldownSeconds": s.cooldown_seconds,
             "hysteresisPct": s.hysteresis_pct,
             "strategy": s.strategy,
+            "pausedUntil": s.paused_until,
         }
 
     def human(self) -> str:
@@ -785,6 +799,31 @@ def _binding_recovery_ts(
     return ts if ts is not None and ts > now else float("inf")
 
 
+def escape_candidate(
+    candidates: Sequence[str],
+    statuses: Mapping[str, AccountPolicyStatus],
+    headroom: Mapping[str, float | None],
+) -> tuple[str | None, int | None, list[list[str]]]:
+    """Where an escape (policy-limit, at-limit, failover) would land now.
+
+    The engine's own pieces with an escape's settings: ``candidate_tiers``
+    with every tier (reserve included), then, group by group, the account
+    with the most headroom (h > 0, unknown skipped; ties keep sequence
+    order) — escapes skip the hysteresis and no-return gates. Read-only:
+    ``cswap policy list`` reports it as ``nextCandidate``. Returns
+    ``(number, tier index, tiers)``; number is None when nothing qualifies.
+    """
+    tiers = candidate_tiers(candidates, statuses, include_reserve=True)
+    for index, tier in enumerate(tiers):
+        usable = [
+            n for n in tier
+            if (h := headroom.get(n)) is not None and h > 0
+        ]
+        if usable:
+            return max(usable, key=lambda n: headroom[n]), index, tiers
+    return None, None, tiers
+
+
 class ThresholdMap(dict):
     """Effective switch threshold per account number — total by construction.
 
@@ -923,6 +962,14 @@ class AutoSwitchEngine:
         # account_limits.json warnings already reported (re-emitted only when
         # the set changes, so a bad hand edit doesn't spam every tick).
         self._policy_warnings_seen: tuple[str, ...] = ()
+        # autoswitch_status.json: what this tick decided (filled from the
+        # events it emits), and whether run_loop writes the file itself
+        # (with the real next-tick time) instead of tick().
+        self._started_at = clock()
+        self._last_tick_at: float | None = None
+        self._tick_record: dict = {}
+        self._paused_until: float | str | None = None
+        self._in_loop = False
 
     # -- state file ---------------------------------------------------------
 
@@ -1244,7 +1291,19 @@ class AutoSwitchEngine:
     # -- tick -----------------------------------------------------------------
 
     def tick(self) -> TickOutcome:
-        """Evaluate once: poll usage, maybe switch. Never raises."""
+        """Evaluate once: poll usage, maybe switch. Never raises.
+
+        A real (non dry-run) engine then records the outcome in
+        ``autoswitch_status.json``; inside ``run_loop`` that write waits for
+        the next delay so the file carries the real next tick time."""
+        self._tick_record = {}
+        outcome = self._tick_guarded()
+        self._last_tick_at = self.clock()
+        if not self._in_loop:
+            self._write_status(outcome, next_tick_at=None)
+        return outcome
+
+    def _tick_guarded(self) -> TickOutcome:
         try:
             outcome = self._tick_inner()
             self._persist_health_counters(self._health_account)
@@ -1456,6 +1515,7 @@ class AutoSwitchEngine:
         self._idle_hold_slow = False
         self._maybe_reload_settings()
         settings = self.settings
+        self._paused_until = self._current_pause()
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -1579,6 +1639,16 @@ class AutoSwitchEngine:
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
+
+        if self._paused_until is not None:
+            # Paused: the poll above keeps every view live, but nothing
+            # below may switch — not even a limit escape.
+            self._emit(
+                NoSwitchEvent(
+                    reason="paused", detail=_pause_detail(self._paused_until)
+                )
+            )
+            return TickOutcome.NO_ACTION
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -3053,7 +3123,15 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            # The switcher's switch path records the history line and starts
+            # onSwitchCommand (once) with this trigger and this tick's
+            # command — the engine never runs the hook itself.
+            result = self.switcher.switch_to(
+                number,
+                json_output=True,
+                trigger=trigger,
+                on_switch_command=self.settings.on_switch_command,
+            )
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
@@ -3095,44 +3173,7 @@ class AutoSwitchEngine:
                 to_label=self._account_label(number),
             )
         )
-        self._run_on_switch_hook(result, trigger)
         return TickOutcome.SWITCHED
-
-    def _run_on_switch_hook(self, result: dict, trigger: str) -> None:
-        """Start ``settings.on_switch_command`` detached after a real switch.
-
-        Fire-and-forget: the engine never waits on it (a cron ``--once`` tick
-        returns immediately) and a failure to start it is reported as a
-        warning, never as a failed switch.
-        """
-        command = self.settings.on_switch_command
-        if not command:
-            return
-        src = result.get("from") or {}
-        dst = result.get("to") or {}
-        env = {
-            **os.environ,
-            "CSWAP_FROM": str(src.get("number", "")),
-            "CSWAP_TO": str(dst.get("number", "")),
-            "CSWAP_TO_EMAIL": str(dst.get("email", "")),
-            "CSWAP_TRIGGER": trigger,
-        }
-        try:
-            subprocess.Popen(
-                command,
-                shell=True,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError as e:
-            self._emit(
-                ConfigWarningEvent(
-                    message=f"autoswitch.onSwitchCommand could not start: {e}"
-                )
-            )
 
     # -- helpers --------------------------------------------------------------
 
@@ -3241,7 +3282,98 @@ class AutoSwitchEngine:
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
+        self._note_event(event)
         self.on_event(event)
+
+    def _note_event(self, event: AutoSwitchEvent) -> None:
+        """Remember what this tick decided, for autoswitch_status.json.
+        The last decision event of a tick wins; details carry no emails."""
+        rec = self._tick_record
+        if isinstance(event, PollEvent):
+            if event.active:
+                rec["active"] = str(event.active.get("number"))
+        elif isinstance(event, SwitchEvent):
+            rec["trigger"] = event.trigger
+            rec["reason"] = "switched"
+            src = (
+                f"#{event.from_ref.get('number')}" if event.from_ref else "(none)"
+            )
+            dst = f"#{event.to_ref.get('number')}" if event.to_ref else "?"
+            rec["detail"] = f"{src} -> {dst}"
+            if event.to_ref:
+                rec["active"] = str(event.to_ref.get("number"))
+        elif isinstance(event, NoSwitchEvent):
+            rec["reason"] = event.reason
+            rec["detail"] = redact_emails(event.detail)
+        elif isinstance(event, PolicyLimitEvent):
+            rec["trigger"] = "policy-limit"
+        elif isinstance(event, (PolicyExhaustedEvent, AllExhaustedEvent)):
+            rec["reason"] = event.kind
+            rec["detail"] = redact_emails(event.human())
+        elif isinstance(event, ErrorEvent):
+            rec["reason"] = "error"
+            rec["detail"] = redact_emails(event.message)
+
+    def _current_pause(self) -> float | str | None:
+        """autoswitch.pausedUntil as in force now, read from settings.json
+        every tick (so `cswap auto --pause/--resume` reach a running loop
+        even without a settings loader). None = not paused."""
+        try:
+            value = load_settings(self.switcher.backup_dir).paused_until
+        except Exception:
+            value = self.settings.paused_until
+        if value is None:
+            return None  # the common case reads no clock
+        return value if pause_active(value, self.clock()) else None
+
+    def _status_payload(
+        self, outcome: TickOutcome, next_tick_at: float | None
+    ) -> dict:
+        s = self.settings
+        rec = self._tick_record
+        return {
+            "schemaVersion": STATUS_SCHEMA_VERSION,
+            "pid": os.getpid(),
+            "startedAt": self._started_at,
+            "lastTickAt": self._last_tick_at,
+            "nextTickAt": next_tick_at,
+            "outcome": outcome.name.lower().replace("_", "-"),
+            "trigger": rec.get("trigger"),
+            "reason": rec.get("reason"),
+            "detail": rec.get("detail", ""),
+            "active": rec.get("active"),
+            "paused": self._paused_until is not None,
+            "settings": {
+                "threshold": s.threshold,
+                "weeklyThreshold": s.weekly_threshold,
+                "intervalSeconds": s.interval_seconds,
+                "cooldownSeconds": s.cooldown_seconds,
+                "hysteresisPct": s.hysteresis_pct,
+                "strategy": s.strategy,
+                "includeApiKeyAccounts": s.include_api_key_accounts,
+                "unhealthyTicks": s.unhealthy_ticks,
+                "model": s.model,
+                # Whether a hook is set, not the command line itself.
+                "onSwitchCommand": bool(s.on_switch_command),
+                "pausedUntil": self._paused_until,
+            },
+        }
+
+    def _write_status(
+        self, outcome: TickOutcome, next_tick_at: float | None
+    ) -> None:
+        """Atomically replace autoswitch_status.json. Dry-run writes
+        nothing (a TUI preview must not overwrite the service's file); a
+        failed write is logged, never raised."""
+        if self.dry_run:
+            return
+        try:
+            write_status(
+                self.switcher.backup_dir,
+                self._status_payload(outcome, next_tick_at),
+            )
+        except Exception as e:
+            _logger.warning("could not write autoswitch status: %r", e)
 
     # -- loop -------------------------------------------------------------------
 
@@ -3323,6 +3455,7 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        self._in_loop = True
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
@@ -3338,6 +3471,7 @@ class AutoSwitchEngine:
                 )
                 outcome = TickOutcome.ERROR
             delay = self._next_delay(outcome)
+            self._write_status(outcome, next_tick_at=self.clock() + delay)
             if delay > self.settings.interval_seconds * 1.5:
                 until = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 self._emit(

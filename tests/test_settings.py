@@ -157,16 +157,21 @@ class TestUiSettings:
 
 
 class TestUpdateSettings:
-    def test_missing_file_checks(self, tmp_path: Path):
-        assert load_update_settings(tmp_path) == UpdateSettings(check=True)
+    def test_missing_file_does_not_check(self, tmp_path: Path):
+        # Off by default in this fork: its version is not on PyPI.
+        assert load_update_settings(tmp_path) == UpdateSettings(check=False)
+
+    def test_reads_true(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"updates": {"check": True}}))
+        assert load_update_settings(tmp_path).check is True
 
     def test_reads_false(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({"updates": {"check": False}}))
         assert load_update_settings(tmp_path).check is False
 
     def test_non_boolean_falls_back_to_default(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({"updates": {"check": "false"}}))
-        assert load_update_settings(tmp_path).check is True
+        settings_path(tmp_path).write_text(json.dumps({"updates": {"check": "true"}}))
+        assert load_update_settings(tmp_path).check is False
 
     def test_set_and_unset_updates_check(self, tmp_path: Path):
         assert set_setting(tmp_path, "updates.check", "false") is False

@@ -67,10 +67,14 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
-    # Shell command run in the background after every automatic switch, with
-    # CSWAP_FROM / CSWAP_TO / CSWAP_TO_EMAIL / CSWAP_TRIGGER in its env
-    # (e.g. a script that re-attaches `claude remote-control`). None = off.
+    # Shell command run in the background after every switch — automatic
+    # and manual (CSWAP_TRIGGER=manual) — with CSWAP_FROM / CSWAP_TO /
+    # CSWAP_TO_EMAIL / CSWAP_TRIGGER in its env (e.g. a script that
+    # re-attaches `claude remote-control`). None = off.
     on_switch_command: str | None = None
+    # Pause: while set and not expired, a running `cswap auto` keeps polling
+    # but never switches. Epoch seconds, or "forever". None = not paused.
+    paused_until: float | str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,9 +89,10 @@ class UiSettings:
 class UpdateSettings:
     """Update notification (``updates`` section). ``check`` turns the daily
     PyPI lookup behind the "newer version available" hint on or off;
-    ``cswap upgrade`` works either way."""
+    ``cswap upgrade`` works either way. Off by default in this fork: its
+    version is not on PyPI, so the hint would always point at upstream."""
 
-    check: bool = True
+    check: bool = False
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -109,7 +114,7 @@ class SettingSpec:
     section: str  # top-level JSON section ("autoswitch", "ui", "updates")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
-    kind: str  # "float" | "int" | "bool" | "choice"
+    kind: str  # "float" | "int" | "bool" | "choice" | "string" | "pause"
     lo: float | None = None
     hi: float | None = None
     choices: tuple[str, ...] = ()
@@ -168,7 +173,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "onSwitchCommand", "on_switch_command", "string",
-            help="Command run in the background after each automatic switch",
+            help="Command run in the background after each switch (auto and manual)",
+        ),
+        SettingSpec(
+            "autoswitch", "pausedUntil", "paused_until", "pause",
+            help="Pause auto-switching until this epoch second, or 'forever'",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -233,6 +242,8 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
             kwargs[spec.field] = bool(value)
+        elif spec.kind == "pause":
+            kwargs[spec.field] = normalize_paused_until(value)
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
@@ -246,6 +257,33 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
                 value = spec.default
             kwargs[spec.field] = value
     return AutoSwitchSettings(**kwargs)
+
+
+PAUSE_FOREVER = "forever"
+
+
+def normalize_paused_until(value) -> float | str | None:
+    """A stored pausedUntil as the engine reads it: a finite epoch number,
+    ``"forever"``, or None (not paused; also for anything malformed)."""
+    if value == PAUSE_FOREVER:
+        return PAUSE_FOREVER
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or (isinstance(value, float) and not math.isfinite(value))
+        or value < 0
+    ):
+        return None
+    return float(value)
+
+
+def pause_active(value, now: float) -> bool:
+    """Is a pausedUntil value in force at ``now``? An expired epoch is
+    treated as not paused."""
+    value = normalize_paused_until(value)
+    if value is None:
+        return False
+    return value == PAUSE_FOREVER or value > now
 
 
 def _read_raw(path: Path) -> dict:
@@ -366,6 +404,21 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"{spec.dotted} must be one of: {', '.join(spec.choices)}"
             )
         return raw_value
+    if spec.kind == "pause":
+        text = raw_value.strip()
+        if text.lower() == PAUSE_FOREVER:
+            return PAUSE_FOREVER
+        try:
+            number = float(text)
+        except ValueError:
+            number = None
+        if number is None or not math.isfinite(number) or number < 0:
+            raise ConfigError(
+                f"{spec.dotted} expects epoch seconds or 'forever', got "
+                f"'{raw_value}'; 'cswap auto --pause 2h' and "
+                "'cswap auto --resume' set it for you"
+            )
+        return number
     if spec.kind == "string":
         value = raw_value.strip()
         if not value:

@@ -646,7 +646,13 @@ class TestUpdateCheckSetting:
             cli.main()
         return check
 
-    def test_checks_by_default(self, tmp_path: Path):
+    def test_does_not_check_by_default(self, tmp_path: Path):
+        self._run_list(tmp_path).assert_not_called()
+
+    def test_setting_true_checks(self, tmp_path: Path):
+        from claude_swap.settings import set_setting
+
+        set_setting(tmp_path, "updates.check", "true")
         self._run_list(tmp_path).assert_called_once_with(__version__)
 
     def test_setting_false_skips_the_check(self, tmp_path: Path):

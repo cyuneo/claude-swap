@@ -119,6 +119,19 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
+### Personal policy, on-switch hook and pause
+
+This fork adds a few controls on top of `cswap auto`:
+
+- **Personal policy** (`cswap policy`). `autoswitch.threshold` is the default line for every window; `cswap policy set N --max-5h 30 --max-7d 80` gives one account its own limits. An own limit is a hard cap: the engine leaves the account as soon as either window reaches it (trigger `policy-limit`, no cooldown, no hysteresis). The same command sets `--priority` (lower is preferred), `--reserve` (used only when no normal account qualifies; the engine moves back once one does) and `--schedule 09:00-14:00` (local time). `cswap policy list` marks limits that follow the threshold with `(default)`; `--json` is the machine feed (see below). `cswap threshold` still works but is superseded by `cswap policy set N --max-5h`.
+- **On-switch hook.** `cswap config set autoswitch.onSwitchCommand '/path/to/script'` runs that command in the background after every switch, automatic or manual (`cswap switch`, the TUI, the menu bar), exactly once and never on `--dry-run`. It gets `CSWAP_FROM`, `CSWAP_TO`, `CSWAP_TO_EMAIL` and `CSWAP_TRIGGER` (`manual` for a manual switch, otherwise the engine's trigger).
+- **Pause.** `cswap auto --pause 2h` (also `30m`, `1d`, or `forever`, the default) and `cswap auto --resume` write `autoswitch.pausedUntil` and exit. A running `cswap auto` re-reads it every tick: while paused it keeps polling the active account but never switches (no-switch reason `paused`). An expired pause counts as not paused.
+- **Status files** in the backup directory, account numbers only (no emails):
+  - `autoswitch_status.json` — written atomically by the running engine after every tick: `pid`, `startedAt`, `lastTickAt`, `nextTickAt`, `outcome`, `trigger`, `reason`, `detail`, `active`, `paused` and the settings in use.
+  - `autoswitch_history.jsonl` — one line per switch, automatic and manual: `{"at", "from", "to", "trigger", "auto"}`, trimmed to the newest 500.
+
+  `cswap policy list --json` combines them (no network): each account row has `state`, `resetsAt5h`/`resetsAt7d`, `usageAgeSeconds`, `lastError`, `quarantined` and `switchable`, and the top-level `autoswitch` object has the rules, `pausedUntil`, `lastSwitch`, `cooldownUntil`, `nextCandidate` (where a limit escape would go right now, and why), `excluded`, `service` (the status file plus a `stale` flag) and the last 20 switches.
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.

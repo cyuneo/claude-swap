@@ -627,6 +627,13 @@ Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
+    # Kept working, but hidden from the top-level help: personal limits
+    # (`cswap policy`) cover the same need per window.
+    print(
+        muted("note: prefer `cswap policy set N --max-5h PCT` (own 5h/7d "
+              "limits per account); `cswap threshold` still works"),
+        file=sys.stderr,
+    )
 
     if args.unset and args.threshold:
         parser.error("--unset does not take a PCT argument")
@@ -691,20 +698,66 @@ def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
 
     Usage comes from the local usage store only (``fetch=set()``) — no
     network — so a row may show the last stored reading."""
+    return _policy_view(switcher)[0]
+
+
+def _policy_view(switcher: ClaudeAccountSwitcher) -> tuple[list[dict], dict]:
+    """``(rows, autoswitch block)`` for `cswap policy list --json`.
+
+    Store-only (no network): the usage store, settings.json,
+    account_limits.json, autoswitch_state.json and the two files the engine
+    writes (autoswitch_status.json, autoswitch_history.jsonl). The
+    autoswitch block names accounts by number only, never by email."""
     import time
 
     from claude_swap.account_policy import evaluate_account_policy, load_policies
-    from claude_swap.settings import load_settings, parse_model_names
+    from claude_swap.autoswitch import (
+        STATE_FILENAME,
+        _headroom_by_account,
+        escape_candidate,
+    )
+    from claude_swap.autoswitch_files import read_history, read_status, redact_emails
+    from claude_swap.poll_policy import parse_reset_ts
+    from claude_swap.settings import (
+        load_settings,
+        normalize_paused_until,
+        parse_model_names,
+        pause_active,
+        settings_path,
+    )
 
     root = switcher.backup_dir
+    now = time.time()
     settings = load_settings(root)
     models = parse_model_names(settings.model)
     table = load_policies(root)
     for msg in table.warnings:
         # stderr: keeps `policy list --json` stdout parseable.
         warning(f"account_limits.json: {msg}", file=sys.stderr)
+    try:
+        state = json.loads((root / STATE_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    quarantine = state.get("quarantine") if isinstance(state.get("quarantine"), dict) else {}
+
+    def quarantine_reason(num: str) -> str | None:
+        entry = quarantine.get(num)
+        if entry is None:
+            return None
+        reason = entry.get("reason") if isinstance(entry, dict) else None
+        return redact_emails(str(reason or "quarantined"))
+
+    def reset_ts(last_good: dict | None, key: str) -> float | None:
+        window = (last_good or {}).get(key)
+        if not isinstance(window, dict):
+            return None
+        return parse_reset_ts(window.get("resets_at"))
+
     snapshot = switcher.accounts_snapshot(fetch=set())
     rows: list[dict] = []
+    statuses: dict = {}
     seen = set()
     for acc in snapshot.accounts:
         policy = table.get(acc.email, acc.org_uuid)
@@ -719,32 +772,34 @@ def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
         )
         st = evaluate_account_policy(
             policy, acc.usage.decision_value(), line, models,
-            now=time.time(), weekly_threshold=settings.weekly_threshold,
+            now=now, weekly_threshold=settings.weekly_threshold,
         )
+        statuses[acc.number] = st
         window = st.blocking_window()
         # `state` is the machine enum consumers switch on; `status` is the
         # English display text. Only an own max5h/max7d is a personal limit:
         # a window over a switch line reads "Over threshold", never
         # "Policy-limit".
         if acc.disabled:
-            state, status = "disabled", "Disabled"
+            state_, status = "disabled", "Disabled"
         elif window is not None:
-            state = "limit"
+            state_ = "limit"
             status = (
                 f"Policy-limit ({window.label})"
                 if window.own
                 else f"Over threshold ({window.label})"
             )
         elif st.off_schedule:
-            state, status = "off-schedule", "Off-schedule"
+            state_, status = "off-schedule", "Off-schedule"
         elif st.reserve:
-            state, status = "reserve", "Reserve"
+            state_, status = "reserve", "Reserve"
         elif not st.known:
-            state, status = "unknown", "Usage unknown"
+            state_, status = "unknown", "Usage unknown"
         elif acc.is_active:
-            state, status = "active", "Active"
+            state_, status = "active", "Active"
         else:
-            state, status = "ready", "Ready"
+            state_, status = "ready", "Ready"
+        usage = acc.usage
         rows.append({
             "number": acc.number,
             "name": acc.alias or acc.email,
@@ -761,10 +816,22 @@ def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
             "usage7d": st.pct("7d"),
             "status": status,
             "reason": st.reason(),
-            "state": state,
-            "blockedWindow": window.label if state == "limit" else None,
+            "state": state_,
+            "blockedWindow": window.label if state_ == "limit" else None,
             "max5hSource": st.max_5h_source,
             "max7dSource": st.max_7d_source,
+            "resetsAt5h": reset_ts(usage.last_good, "five_hour"),
+            "resetsAt7d": reset_ts(usage.last_good, "seven_day"),
+            "usageAgeSeconds": (
+                round(usage.age_s, 1) if usage.age_s is not None else None
+            ),
+            "lastError": (
+                redact_emails(usage.last_error) if usage.last_error else None
+            ),
+            "quarantined": quarantine_reason(acc.number),
+            "switchable": (
+                acc.switchable and not acc.disabled and acc.kind != "api_key"
+            ),
         })
     for identity, policy in table.policies.items():
         if identity not in seen:
@@ -782,8 +849,135 @@ def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
                     else "threshold" if settings.weekly_threshold is None
                     else "weekly"
                 ),
+                "resetsAt5h": None, "resetsAt7d": None,
+                "usageAgeSeconds": None, "lastError": None,
+                "quarantined": None, "switchable": False,
             })
-    return rows
+
+    # -- where an escape would go now, and why the others would not --------
+    by_num = {r["number"]: r for r in rows if r["number"] is not None}
+    candidates: list[str] = []
+    excluded: dict[str, str] = {}
+    for acc in snapshot.accounts:
+        num = acc.number
+        if acc.is_active:
+            continue
+        if acc.disabled:
+            excluded[num] = "disabled"
+        elif not acc.switchable:
+            excluded[num] = "no stored backup"
+        elif acc.kind == "api_key":
+            excluded[num] = "api-key account"
+        elif num in quarantine:
+            excluded[num] = f"quarantined: {quarantine_reason(num)}"
+        else:
+            candidates.append(num)
+    headroom = _headroom_by_account(
+        {a.number: a.usage.decision_value() for a in snapshot.accounts
+         if a.number in candidates},
+        models,
+    )
+    target, tier_index, tiers = escape_candidate(candidates, statuses, headroom)
+    in_tiers = {n for tier in tiers for n in tier}
+    eligible: list[str] = []
+    for num in candidates:
+        st = statuses[num]
+        row = by_num[num]
+        if num == target:
+            continue
+        if num not in in_tiers:
+            excluded[num] = (
+                f"off-schedule ({', '.join(st.schedule)})"
+                if st.off_schedule
+                else (
+                    f"policy limit ({st.reason()})"
+                    if (w := st.blocking_window()) is not None and w.own
+                    else f"over threshold ({st.reason()})"
+                )
+            )
+        elif headroom.get(num) is None:
+            excluded[num] = (
+                f"usage unknown ({row['lastError']})"
+                if row["lastError"]
+                else "usage unknown"
+            )
+        elif headroom[num] <= 0:
+            excluded[num] = "no headroom"
+        else:
+            eligible.append(num)
+    next_candidate = None
+    if target is not None:
+        st = statuses[target]
+        why = [
+            "only eligible account" if not eligible
+            else f"most headroom in group {tier_index + 1} of {len(tiers)}"
+        ]
+        if st.scheduled_now:
+            why.append("inside its schedule window")
+        if st.reserve:
+            why.append("reserve: used only while no normal account qualifies")
+        next_candidate = {
+            "number": target,
+            "reserve": st.reserve,
+            "priority": st.priority,
+            "scheduledNow": st.scheduled_now,
+            "headroomPct": round(headroom[target], 1),
+            "why": "; ".join(why),
+        }
+
+    # -- last switch, cooldown, service, history ------------------------------
+    history = read_history(root, limit=20)
+    last_switch = history[0] if history else None
+    state_at = state.get("lastSwitchAt")
+    if isinstance(state_at, (int, float)) and (
+        last_switch is None or (last_switch.get("at") or 0) < state_at - 1
+    ):
+        # Older engines recorded only the state file.
+        last_switch = {
+            "at": state_at,
+            "from": None if state.get("lastSwitchFrom") is None else str(state["lastSwitchFrom"]),
+            "to": None if state.get("lastSwitchTo") is None else str(state["lastSwitchTo"]),
+            "trigger": state.get("leftTrigger"),
+            "auto": True,
+        }
+    cooldown_until = None
+    if isinstance(state_at, (int, float)):
+        end = state_at + settings.cooldown_seconds
+        cooldown_until = end if end > now else None
+
+    service = read_status(root)
+    if service is not None:
+        service.pop("stale", None)
+        interval = (service.get("settings") or {}).get("intervalSeconds")
+        if not isinstance(interval, (int, float)):
+            interval = settings.interval_seconds
+        last_tick = service.get("lastTickAt")
+        service["stale"] = (
+            not isinstance(last_tick, (int, float))
+            or now - last_tick > max(3 * interval, 180.0)
+        )
+    try:
+        settings_mtime = settings_path(root).stat().st_mtime
+    except OSError:
+        settings_mtime = None
+    paused_until = normalize_paused_until(settings.paused_until)
+    block = {
+        "threshold": settings.threshold,
+        "weeklyThreshold": settings.weekly_threshold,
+        "intervalSeconds": settings.interval_seconds,
+        "cooldownSeconds": settings.cooldown_seconds,
+        "hysteresisPct": settings.hysteresis_pct,
+        "strategy": settings.strategy,
+        "pausedUntil": paused_until if pause_active(paused_until, now) else None,
+        "settingsMtime": settings_mtime,
+        "lastSwitch": last_switch,
+        "cooldownUntil": cooldown_until,
+        "nextCandidate": next_candidate,
+        "excluded": excluded,
+        "service": service,
+        "history": history,
+    }
+    return rows, block
 
 
 def _policy_command(argv: list[str]) -> None:
@@ -895,14 +1089,15 @@ Examples:
         if action == "path":
             print(policy_path(root))
         elif action == "list":
-            rows = _policy_rows(switcher)
             if getattr(args, "json", False):
+                rows, block = _policy_view(switcher)
                 print(json.dumps(
                     {"schemaVersion": 1, "path": str(policy_path(root)),
-                     "accounts": rows},
+                     "accounts": rows, "autoswitch": block},
                     indent=2,
                 ))
                 return
+            rows = _policy_rows(switcher)
             if not rows:
                 print(dimmed("No accounts are managed yet"))
                 return
@@ -1056,6 +1251,9 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cswap auto --pause 2h            # running loop keeps polling, never switches
+  cswap auto --pause               # same, until --resume
+  cswap auto --resume
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -1136,12 +1334,33 @@ Defaults live in settings.json in the backup root; flags override them.
         action="store_true",
         help="Evaluate and report, but never switch or write state",
     )
+    pause_group = parser.add_mutually_exclusive_group()
+    pause_group.add_argument(
+        "--pause",
+        nargs="?",
+        const="forever",
+        metavar="DURATION",
+        help=(
+            "Pause auto-switching (30m, 2h, 1d, or 'forever'; default "
+            "forever): a running `cswap auto` keeps polling but never "
+            "switches. Writes autoswitch.pausedUntil and exits"
+        ),
+    )
+    pause_group.add_argument(
+        "--resume",
+        action="store_true",
+        help="End a pause (clears autoswitch.pausedUntil) and exit",
+    )
     parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
     )
     args = parser.parse_args(argv)
+
+    if args.pause is not None or args.resume:
+        _pause_command(parser, args)
+        return
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
@@ -1215,6 +1434,66 @@ Defaults live in settings.json in the backup root; flags override them.
             file=sys.stderr if args.json else sys.stdout,
         )
         sys.exit(130)
+
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_pause_duration(text: str) -> float | None:
+    """Seconds for "30m" / "2h" / "1d" / "90s"; None for "forever".
+    Raises ValueError for anything else."""
+    text = text.strip().lower()
+    if text == "forever":
+        return None
+    unit = text[-1:] if text[-1:] in _DURATION_UNITS else None
+    number = text[:-1] if unit else text
+    try:
+        value = float(number)
+    except ValueError:
+        raise ValueError(
+            f"invalid duration '{text}' (use e.g. 30m, 2h, 1d or forever)"
+        ) from None
+    if not value > 0 or value != value or value == float("inf"):
+        raise ValueError(f"duration must be positive, got '{text}'")
+    # A bare number means minutes.
+    return value * _DURATION_UNITS[unit or "m"]
+
+
+def _pause_command(parser: argparse.ArgumentParser, args) -> None:
+    """`cswap auto --pause [DURATION]` / `--resume`: write or clear
+    autoswitch.pausedUntil, print one line, exit. The running engine reads
+    it at its next tick; no engine is started here."""
+    import time as _time
+
+    from claude_swap.settings import set_setting, unset_setting
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        root = switcher.backup_dir
+        if args.resume:
+            if unset_setting(root, "autoswitch.pausedUntil"):
+                print(f"{accent('Auto-switch resumed')}")
+            else:
+                print(dimmed("Auto-switch was not paused"))
+            return
+        try:
+            seconds = _parse_pause_duration(args.pause)
+        except ValueError as e:
+            parser.error(str(e))
+        if seconds is None:
+            set_setting(root, "autoswitch.pausedUntil", "forever")
+            print(f"{accent('Auto-switch paused')} until `cswap auto --resume`")
+            return
+        until = _time.time() + seconds
+        set_setting(root, "autoswitch.pausedUntil", repr(round(until, 3)))
+        print(
+            f"{accent('Auto-switch paused')} until "
+            f"{_time.strftime('%Y-%m-%d %H:%M', _time.localtime(until))}"
+        )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
 
 
 def _config_command(argv: list[str]) -> None:
@@ -1524,9 +1803,8 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
-  %(prog)s threshold <num|email> <pct>  set one account's switch-away point
-  %(prog)s threshold <num|email> --unset  clear it (use the global default)
-  %(prog)s threshold                  list the global default and overrides
+  %(prog)s policy list [--json]       per-account limits, priority, reserve, schedule
+  %(prog)s policy set <num|email> --max-5h N  set an account's own 5h limit
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account
@@ -1538,6 +1816,8 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s auto --pause [30m|2h|1d|forever]  pause a running auto-switch
+  %(prog)s auto --resume              resume it
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
@@ -1563,6 +1843,8 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
+  %(prog)s auto --pause 2h                   # keep polling, never switch, for 2 hours
+  %(prog)s policy set 2 --max-5h 80 --priority 1
   %(prog)s config set autoswitch.threshold 80
 
 The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.

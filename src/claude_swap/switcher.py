@@ -92,6 +92,14 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.autoswitch_files import (
+    MANUAL_TRIGGER,
+    append_history,
+    run_on_switch_command,
+)
+
+# Sentinel for ``_perform_switch``'s hook command: read it from settings.json.
+_HOOK_FROM_SETTINGS = object()
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -6440,9 +6448,18 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        *,
+        trigger: str = MANUAL_TRIGGER,
+        on_switch_command: object = _HOOK_FROM_SETTINGS,
     ) -> dict | None:
         """Switch to specific account.
+
+        ``trigger``/``on_switch_command`` are for the auto engine (see
+        ``_perform_switch``); every other caller keeps the defaults.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
@@ -6545,6 +6562,8 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            trigger=trigger,
+            on_switch_command=on_switch_command,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -6926,6 +6945,65 @@ class ClaudeAccountSwitcher:
         )
 
     def _perform_switch(
+        self,
+        target_account: str,
+        emit_output: bool = True,
+        force_activate: bool = False,
+        provenance: dict | None = None,
+        *,
+        trigger: str = MANUAL_TRIGGER,
+        on_switch_command: object = _HOOK_FROM_SETTINGS,
+    ) -> dict:
+        """The one switch path every surface goes through (CLI, TUI,
+        menubar, the auto engine). After a real switch — the live identity
+        changed — it appends the switch to ``autoswitch_history.jsonl`` and
+        starts ``autoswitch.onSwitchCommand``, exactly once, with
+        ``CSWAP_TRIGGER`` = ``trigger`` (``"manual"`` unless the auto engine
+        says otherwise). The engine passes its own settings snapshot's
+        command; everyone else reads settings.json. Neither step can fail
+        the switch: a hook that cannot start becomes a warning.
+        """
+        op = self._perform_switch_inner(
+            target_account, emit_output, force_activate, provenance
+        )
+        if op.get("from") != op.get("to"):
+            self._after_switch(op, trigger, on_switch_command, emit_output)
+        return op
+
+    def _after_switch(
+        self, op: dict, trigger: str, on_switch_command: object, emit_output: bool
+    ) -> None:
+        src = op.get("from") or {}
+        dst = op.get("to") or {}
+        try:
+            append_history(
+                self.backup_dir,
+                from_number=src.get("number"),
+                to_number=dst.get("number"),
+                trigger=trigger,
+            )
+        except Exception as e:  # history is a record, never a reason to fail
+            self._logger.warning(f"Could not record switch history: {e!r}")
+        if on_switch_command is _HOOK_FROM_SETTINGS:
+            try:
+                on_switch_command = load_settings(self.backup_dir).on_switch_command
+            except Exception:
+                on_switch_command = None
+        problem = run_on_switch_command(
+            on_switch_command,
+            from_number=src.get("number"),
+            to_number=dst.get("number"),
+            to_email=dst.get("email", ""),
+            trigger=trigger,
+        )
+        if problem:
+            self._logger.warning(problem)
+            if emit_output:
+                warning(problem)
+            else:
+                op.setdefault("warnings", []).append(problem)
+
+    def _perform_switch_inner(
         self,
         target_account: str,
         emit_output: bool = True,
