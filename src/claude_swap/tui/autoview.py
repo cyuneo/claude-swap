@@ -46,6 +46,9 @@ _EVENT_ROLES = {
     "error": "sev_warn",
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
+    "policy-limit": "sev_warn",
+    "policy-exhausted": "sev_crit",
+    "reserve-in-use": "sev_warn",
 }
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 

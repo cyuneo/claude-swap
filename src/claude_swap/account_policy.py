@@ -377,6 +377,8 @@ class PolicyWindow:
     label: str  # "5h", "7d", or a scoped model name
     pct: float
     limit: float
+    # The limit is the account's own max5h/max7d, not a switch line.
+    own: bool = False
 
     @property
     def blocked(self) -> bool:
@@ -390,6 +392,13 @@ class AccountPolicyStatus:
     ``configured`` is False for accounts without an entry: their limits are
     the global threshold, which the engine's own logic already enforces.
     ``windows`` is empty when usage is unknown — unknown is never blocked.
+
+    ``max_5h_source`` / ``max_7d_source`` say where each limit came from:
+    ``"own"`` (the entry's max5h/max7d), ``"threshold"`` (the account's switch
+    line) or ``"weekly"`` (autoswitch.weeklyThreshold, 7d only). Only an
+    ``"own"`` limit makes an account a personal-limit account
+    (``has_own_limit``); an entry that just sets priority/reserve/schedule
+    keeps the switch lines.
     """
 
     configured: bool
@@ -400,6 +409,13 @@ class AccountPolicyStatus:
     windows: tuple[PolicyWindow, ...] = ()
     schedule: tuple[str, ...] = ()
     off_schedule: bool = False  # has a schedule and now is outside it
+    max_5h_source: str = "threshold"
+    max_7d_source: str = "threshold"
+
+    @property
+    def has_own_limit(self) -> bool:
+        """The entry sets its own max5h or max7d (a personal limit)."""
+        return "own" in (self.max_5h_source, self.max_7d_source)
 
     @property
     def scheduled_now(self) -> bool:
@@ -431,10 +447,14 @@ class AccountPolicyStatus:
         return max(over, key=lambda w: w.pct - w.limit) if over else None
 
     def reason(self) -> str:
-        """e.g. ``personal 5h limit: 30.4% / 30%`` (empty when not blocked)."""
+        """e.g. ``personal 5h limit: 30.4% / 30%`` for an own limit, or
+        ``threshold 5h: 99% / 98%`` for a switch line (empty when not
+        blocked)."""
         w = self.blocking_window()
         if w is not None:
-            return f"personal {w.label} limit: {w.pct:.10g}% / {w.limit:.10g}%"
+            if w.own:
+                return f"personal {w.label} limit: {w.pct:.10g}% / {w.limit:.10g}%"
+            return f"threshold {w.label}: {w.pct:.10g}% / {w.limit:.10g}%"
         if self.off_schedule:
             return f"outside its schedule ({', '.join(self.schedule)})"
         return ""
@@ -470,11 +490,14 @@ def evaluate_account_policy(
         schedule, datetime.fromtimestamp(now)
     )
     weekly = threshold if weekly_threshold is None else weekly_threshold
-    max_5h = policy.max_5h if policy and policy.max_5h is not None else threshold
-    max_7d = policy.max_7d if policy and policy.max_7d is not None else weekly
+    own_5h = policy is not None and policy.max_5h is not None
+    own_7d = policy is not None and policy.max_7d is not None
+    max_5h = policy.max_5h if own_5h else threshold
+    max_7d = policy.max_7d if own_7d else weekly
     limits = {"5h": max_5h, "7d": max_7d}
+    own = {"5h": own_5h, "7d": own_7d}
     windows = tuple(
-        PolicyWindow(label, pct, limits.get(label, weekly))
+        PolicyWindow(label, pct, limits.get(label, weekly), own.get(label, False))
         for label, pct, _ in oauth.relevant_windows(
             usage if isinstance(usage, dict) else None, models
         )
@@ -492,6 +515,12 @@ def evaluate_account_policy(
         windows=windows,
         schedule=schedule,
         off_schedule=off_schedule,
+        max_5h_source="own" if own_5h else "threshold",
+        max_7d_source=(
+            "own" if own_7d
+            else "threshold" if weekly_threshold is None
+            else "weekly"
+        ),
     )
 
 

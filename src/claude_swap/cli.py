@@ -722,18 +722,29 @@ def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
             now=time.time(), weekly_threshold=settings.weekly_threshold,
         )
         window = st.blocking_window()
+        # `state` is the machine enum consumers switch on; `status` is the
+        # English display text. Only an own max5h/max7d is a personal limit:
+        # a window over a switch line reads "Over threshold", never
+        # "Policy-limit".
         if acc.disabled:
-            status = "Disabled"
+            state, status = "disabled", "Disabled"
         elif window is not None:
-            status = f"Policy-limit ({window.label})"
+            state = "limit"
+            status = (
+                f"Policy-limit ({window.label})"
+                if window.own
+                else f"Over threshold ({window.label})"
+            )
         elif st.off_schedule:
-            status = "Off-schedule"
+            state, status = "off-schedule", "Off-schedule"
         elif st.reserve:
-            status = "Reserve"
+            state, status = "reserve", "Reserve"
         elif not st.known:
-            status = "Usage unknown"
+            state, status = "unknown", "Usage unknown"
+        elif acc.is_active:
+            state, status = "active", "Active"
         else:
-            status = "Active" if acc.is_active else "Ready"
+            state, status = "ready", "Ready"
         rows.append({
             "number": acc.number,
             "name": acc.alias or acc.email,
@@ -750,6 +761,10 @@ def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
             "usage7d": st.pct("7d"),
             "status": status,
             "reason": st.reason(),
+            "state": state,
+            "blockedWindow": window.label if state == "limit" else None,
+            "max5hSource": st.max_5h_source,
+            "max7dSource": st.max_7d_source,
         })
     for identity, policy in table.policies.items():
         if identity not in seen:
@@ -760,6 +775,13 @@ def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
                 "priority": policy.priority, "reserve": policy.reserve,
                 "schedule": list(policy.schedule), "enabled": None, "usage5h": None, "usage7d": None,
                 "status": "Not managed", "reason": "",
+                "state": "unmanaged", "blockedWindow": None,
+                "max5hSource": "own" if policy.max_5h is not None else "threshold",
+                "max7dSource": (
+                    "own" if policy.max_7d is not None
+                    else "threshold" if settings.weekly_threshold is None
+                    else "weekly"
+                ),
             })
     return rows
 
@@ -776,8 +798,10 @@ def _policy_command(argv: list[str]) -> None:
         description=(
             "Per-account personal usage limits for `cswap auto`. A personal "
             "limit is your own ceiling on the 5h/7d utilization Claude "
-            "reports — not an Anthropic quota. Accounts without a policy use "
-            "autoswitch.threshold."
+            "reports — not an Anthropic quota. Only an own --max-5h/--max-7d "
+            "is a personal limit (left at once, no cooldown or hysteresis); "
+            "limits not set follow autoswitch.threshold and are left like "
+            "any account over its threshold."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -855,6 +879,14 @@ Examples:
     def pct(value) -> str:
         return "-" if value is None else f"{value:.10g}%"
 
+    def limit(row: dict, key: str) -> str:
+        """A limit cell: "30%" for an own limit, "98% (default)" for one
+        that follows a switch line."""
+        text = pct(row[key])
+        if row[f"{key}Source"] != "own" and row[key] is not None:
+            text += " (default)"
+        return text
+
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
@@ -881,13 +913,13 @@ Examples:
                 label = f"{r['number']}: {r['name']}" if r["number"] else r["name"]
                 table.append((
                     ("* " if r["active"] else "  ") + label,
-                    pct(r["max5h"]),
-                    pct(r["max7d"]),
+                    limit(r, "max5h"),
+                    limit(r, "max7d"),
                     "-" if r["priority"] is None else str(r["priority"]),
                     "Yes" if r["reserve"] else "No",
                     ",".join(r["schedule"]) or "any",
                     f"{pct(r['usage5h'])} / {pct(r['usage7d'])}",
-                    r["status"] if r["configured"] else f"{r['status']} (default)",
+                    r["status"],
                 ))
             widths = [max(len(h), *(len(t[i]) for t in table))
                       for i, h in enumerate(headers)]
@@ -895,9 +927,10 @@ Examples:
             for t in table:
                 print("  ".join(c.ljust(w) for c, w in zip(t, widths)).rstrip())
             print(dimmed(
-                "(default) = no policy: limits follow the switch lines "
+                "(default) = no own limit: it follows the switch lines "
                 "(cswap threshold / autoswitch.threshold, "
-                "autoswitch.weeklyThreshold for 7d). "
+                "autoswitch.weeklyThreshold for 7d) and departs like any "
+                "account over its threshold. "
                 "Usage is the last stored reading. Schedules use this "
                 f"machine's local time (now {time.strftime('%H:%M %Z')})."
             ))
@@ -905,10 +938,13 @@ Examples:
             num, email, org = switcher.resolve_account(args.account)
             row = next(r for r in _policy_rows(switcher) if r["number"] == num)
             print(bolded(f"Account-{num} ({row['name']})"))
-            source = "account_limits.json" if row["configured"] else \
-                "autoswitch.threshold (no policy)"
-            print(f"  5h: {pct(row['usage5h'])} / limit {pct(row['max5h'])}")
-            print(f"  7d: {pct(row['usage7d'])} / limit {pct(row['max7d'])}")
+            source = (
+                "account_limits.json"
+                if "own" in (row["max5hSource"], row["max7dSource"])
+                else "the switch lines (no own limit)"
+            )
+            print(f"  5h: {pct(row['usage5h'])} / limit {limit(row, 'max5h')}")
+            print(f"  7d: {pct(row['usage7d'])} / limit {limit(row, 'max7d')}")
             print(f"  Schedule: {', '.join(row['schedule']) or 'any time'}"
                   f" (local time, now {time.strftime('%H:%M %Z')})")
             print(f"  Priority: {row['priority']}   Reserve: "
@@ -1141,6 +1177,11 @@ Defaults live in settings.json in the backup root; flags override them.
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            # `cswap config set autoswitch.*` reaches the running loop at its
+            # next tick; CLI flags keep overriding the reloaded values.
+            settings_loader=lambda: merged_with_cli(
+                load_settings(switcher.backup_dir), args
+            ),
         )
 
         if args.once:

@@ -69,7 +69,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -362,8 +367,11 @@ class PollEvent(AutoSwitchEvent):
     # the engine compares, never to the numbers it logs.
     weekly_threshold: float | None = None
     # Active account's personal 5h/7d limits (account_limits.json) when it has
-    # a policy, e.g. {"5h": 30.0, "7d": 30.0}. Additive field.
+    # its own max5h/max7d, e.g. {"5h": 30.0, "7d": 30.0}. Additive field.
     personal_limits: dict[str, float] = field(default_factory=dict)
+    # Human-only label of the active account ("#2" or "#2 (alias)"); never an
+    # email, so the journal of a long-running `cswap auto` carries none.
+    label: str = ""
 
     def _fields(self) -> dict:
         fields = {
@@ -428,20 +436,22 @@ class PollEvent(AutoSwitchEvent):
             )
         else:
             switch_at = f"switch at {pct_label(line)}%"
-        return (
-            f"Account-{num} ({self.active.get('email')}): {used} "
-            f"({switch_at}){tail}"
-        )
+        return f"{self.label or f'#{num}'}: {used} ({switch_at}){tail}"
 
 
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    # "proactive" | "at-limit" | "failover" | "consume-first" |
+    # "policy-limit" | "reserve-return" | "schedule"
+    trigger: str
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    # Human-only label of the target ("#3" or "#3 (alias)"); the JSON keeps
+    # the full ``to`` ref, the human line never names an email.
+    to_label: str = ""
 
     def _fields(self) -> dict:
         return {
@@ -453,11 +463,9 @@ class SwitchEvent(AutoSwitchEvent):
         }
 
     def human(self) -> str:
-        src = (
-            f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
-        )
+        src = f"#{self.from_ref.get('number')}" if self.from_ref else "(none)"
         dst = (
-            f"Account-{self.to_ref.get('number')} ({self.to_ref.get('email')})"
+            self.to_label or f"#{self.to_ref.get('number')}"
             if self.to_ref
             else "?"
         )
@@ -567,11 +575,43 @@ class ConfigWarningEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class SettingsReloadedEvent(AutoSwitchEvent):
+    """settings.json changed and the running engine now uses its values."""
+
+    kind: ClassVar[str] = "settings-reloaded"
+    settings: AutoSwitchSettings
+
+    def _fields(self) -> dict:
+        s = self.settings
+        return {
+            "threshold": s.threshold,
+            "weeklyThreshold": s.weekly_threshold,
+            "intervalSeconds": s.interval_seconds,
+            "cooldownSeconds": s.cooldown_seconds,
+            "hysteresisPct": s.hysteresis_pct,
+            "strategy": s.strategy,
+        }
+
+    def human(self) -> str:
+        s = self.settings
+        weekly = (
+            f", weekly {pct_label(s.weekly_threshold)}%"
+            if s.weekly_threshold is not None
+            else ""
+        )
+        return (
+            f"settings reloaded (threshold {pct_label(s.threshold)}%{weekly}, "
+            f"every {s.interval_seconds:.0f}s)"
+        )
+
+
+@dataclass(frozen=True)
 class PolicyLimitEvent(AutoSwitchEvent):
     """The active account reached a PERSONAL limit (account_limits.json).
 
     Deliberately distinct from an Anthropic rate limit: the account still
-    works, the user's own policy just stops treating it as usable."""
+    works, the user's own policy just stops treating it as usable. ``name``
+    is a display label ("#2" or "#2 (alias)"), never an email."""
 
     kind: ClassVar[str] = "policy-limit"
     number: str
@@ -596,19 +636,28 @@ class PolicyExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "policy-exhausted"
     # account number → human reason ("policy limit reached", ...)
     accounts: dict[str, str] = field(default_factory=dict)
+    # account number → display label ("#2 (alias)"); never an email.
+    names: dict[str, str] = field(default_factory=dict)
 
     def _fields(self) -> dict:
-        return {"accounts": self.accounts}
+        fields: dict = {"accounts": self.accounts}
+        if self.names:
+            fields["names"] = self.names
+        return fields
 
     def human(self) -> str:
         lines = ["No account is available under your personal usage policy."]
-        lines += [f"    {name}: {why}" for name, why in self.accounts.items()]
+        lines += [
+            f"    {self.names.get(num, f'#{num}')}: {why}"
+            for num, why in self.accounts.items()
+        ]
         return "\n".join(lines)
 
 
 @dataclass(frozen=True)
 class ReserveInUseEvent(AutoSwitchEvent):
-    """A switch landed on a reserve account (no normal account qualified)."""
+    """A switch landed on a reserve account (no normal account qualified).
+    ``name`` is a display label, never an email."""
 
     kind: ClassVar[str] = "reserve-in-use"
     number: str
@@ -818,9 +867,17 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        settings_loader: Callable[[], AutoSwitchSettings] | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
+        # When given, the engine re-reads the autoswitch settings at the start
+        # of a tick whenever settings.json's mtime changed, so `cswap config
+        # set autoswitch.*` reaches a running loop like `cswap policy set`
+        # does. The loader re-applies the host's own overrides (CLI flags);
+        # hosts with session overrides (the TUI) leave it unset.
+        self._settings_loader = settings_loader
+        self._settings_mtime = self._read_settings_mtime()
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -1056,6 +1113,38 @@ class AutoSwitchEngine:
             return False
         return slot_identity["uuid"] != ta_uuid
 
+    # -- settings reload (settings.json) --------------------------------------
+
+    def _read_settings_mtime(self) -> float | None:
+        try:
+            return settings_path(self.switcher.backup_dir).stat().st_mtime
+        except OSError:
+            return None
+
+    def _maybe_reload_settings(self) -> None:
+        """Swap in freshly loaded settings when settings.json changed since
+        the last look. Runs before the tick snapshots ``self.settings``, so a
+        tick never mixes old and new values. Never raises: a failed load
+        keeps the settings in use."""
+        if self._settings_loader is None:
+            return
+        mtime = self._read_settings_mtime()
+        if mtime == self._settings_mtime:
+            return
+        self._settings_mtime = mtime
+        try:
+            new = self._settings_loader()
+        except Exception as e:
+            _logger.warning("settings reload failed; keeping current: %r", e)
+            return
+        if new == self.settings:
+            return
+        if new.model != self.settings.model:
+            self._models = parse_model_names(new.model)
+            self._model_check_done = not self._models
+        self.settings = new
+        self._emit(SettingsReloadedEvent(settings=new))
+
     # -- personal policy (account_limits.json) --------------------------------
 
     def _load_policy(self) -> PolicyTable:
@@ -1099,11 +1188,17 @@ class AutoSwitchEngine:
             )
         return statuses
 
-    def _account_name(self, num: str) -> str:
-        alias = next(
-            (a for n, a, _ in self.switcher.list_aliases() if n == num), ""
-        )
-        return f"Account-{num} ({alias or self.switcher.account_email(num)})"
+    def _account_label(self, num: str) -> str:
+        """``#N``, plus the alias when one is set and is not itself an email:
+        human event lines end up in the journal, which must not carry
+        emails."""
+        try:
+            alias = next(
+                (a for n, a, _ in self.switcher.list_aliases() if n == num), ""
+            )
+        except Exception:  # display only; never fail a tick over a label
+            alias = ""
+        return f"#{num} ({alias})" if alias and "@" not in alias else f"#{num}"
 
     def _policy_hold(self, trigger: str) -> TickOutcome:
         """A voluntary policy move found no target: staying is correct."""
@@ -1118,9 +1213,9 @@ class AutoSwitchEngine:
         else:
             self._emit(
                 NoSwitchEvent(
-                    reason="reserve-in-use",
-                    detail="on a reserve account; no normal account is under "
-                    "its personal limit yet",
+                    reason="reserve-hold",
+                    detail="on a reserve account; no normal account "
+                    "qualifies yet",
                 )
             )
         return TickOutcome.NO_ACTION
@@ -1359,6 +1454,7 @@ class AutoSwitchEngine:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
+        self._maybe_reload_settings()
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -1434,13 +1530,23 @@ class AutoSwitchEngine:
             threshold=collect_line,
             weekly_threshold=collect_weekly,
         )
+        # ``active_status``: the active account's policy entry, whatever it
+        # sets (reserve, schedule and priority read it). ``active_policy``:
+        # only when that entry is a personal limit — its own max5h/max7d, or
+        # a schedule it is outside of right now. Only then is the account
+        # judged on its own lines and departs via ``policy-limit`` (no
+        # cooldown, no hysteresis); an entry that merely sets priority,
+        # reserve or a schedule departs through the normal threshold path.
+        active_status: AccountPolicyStatus | None = None
         active_policy: AccountPolicyStatus | None = None
         if policy:
             status = self._policy_statuses(
                 policy, [current], usage, thresholds
             )[current]
             if status.configured:
-                active_policy = status
+                active_status = status
+                if status.has_own_limit or status.off_schedule:
+                    active_policy = status
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1452,9 +1558,10 @@ class AutoSwitchEngine:
                 weekly_threshold=settings.weekly_threshold,
                 personal_limits=(
                     {"5h": active_policy.max_5h, "7d": active_policy.max_7d}
-                    if active_policy is not None
+                    if active_policy is not None and active_policy.has_own_limit
                     else {}
                 ),
+                label=self._account_label(current),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -1496,9 +1603,9 @@ class AutoSwitchEngine:
             active_binding = self._binding(
                 usage.get(current), settings, thresholds[current]
             )
-            # An account with a personal policy (account_limits.json) is judged
-            # on its own 5h/7d limits — each window separately, as a hard cap —
-            # instead of the switch line.
+            # An account with a personal limit (its own max5h/max7d in
+            # account_limits.json) is judged on its own 5h/7d limits — each
+            # window separately, as a hard cap — instead of the switch line.
             if active_policy is not None:
                 below = not active_policy.blocked
             else:
@@ -1508,7 +1615,7 @@ class AutoSwitchEngine:
                     else (100.0 - active_headroom) < thresholds[current]
                 )
             if below:
-                if active_policy is not None and active_policy.reserve:
+                if active_status is not None and active_status.reserve:
                     # On a reserve account: hand back to a normal account as
                     # soon as one qualifies (ranking only offers normal tiers
                     # to this trigger), otherwise hold.
@@ -1516,7 +1623,7 @@ class AutoSwitchEngine:
                 elif (
                     policy
                     and not (
-                        active_policy is not None and active_policy.scheduled_now
+                        active_status is not None and active_status.scheduled_now
                     )
                     and self._scheduled_account_ready(
                         policy, current, quarantined, usage, thresholds
@@ -1526,19 +1633,23 @@ class AutoSwitchEngine:
                     # room: that window is when it is meant to be used.
                     trigger = "schedule"
                 elif settings.strategy != "consume-first":
+                    if active_policy is not None:
+                        self._emit(
+                            NoSwitchEvent(
+                                reason="below-personal-limit",
+                                detail=f"personal policy: {active_policy.summary()}",
+                            )
+                        )
+                        return TickOutcome.NO_ACTION
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{active_policy.summary()} (personal policy)"
-                                if active_policy is not None
-                                else _below_line_detail(
-                                    active_binding,
-                                    active_headroom,
-                                    thresholds[current],
-                                )
+                            detail=_below_line_detail(
+                                active_binding,
+                                active_headroom,
+                                thresholds[current],
                             ),
                         )
                     )
@@ -1559,7 +1670,7 @@ class AutoSwitchEngine:
                 self._emit(
                     PolicyLimitEvent(
                         number=current,
-                        name=self._account_name(current),
+                        name=self._account_label(current),
                         reason=active_policy.reason(),
                     )
                 )
@@ -1749,8 +1860,8 @@ class AutoSwitchEngine:
         # ranking — gates, anti-flap bar and strategy key — runs unchanged on
         # each group, and the first group that yields a target wins. Without a
         # policy there is exactly one group, all OAuth candidates.
-        if active_policy is not None:
-            active_priority = active_policy.priority
+        if active_status is not None:
+            active_priority = active_status.priority
         elif policy:
             active_priority = self._policy_statuses(
                 policy, [current], usage, thresholds
@@ -1874,19 +1985,23 @@ class AutoSwitchEngine:
                 policy, [current, *oauth_candidates], usage, thresholds
             )
             report: dict[str, str] = {}
+            names: dict[str, str] = {}
             for num, st in report_statuses.items():
                 if st.blocked:
-                    why = f"policy limit reached ({st.reason()})"
+                    why = (
+                        f"policy limit reached ({st.reason()})"
+                        if st.has_own_limit or st.off_schedule
+                        else f"over threshold ({st.reason()})"
+                    )
                 elif num == current and not st.known:
                     why = "usage unknown"
                 elif num == current:
                     why = "active"
                 else:
                     continue
-                report[self._account_name(num)] = (
-                    f"reserve, {why}" if st.reserve else why
-                )
-            self._emit(PolicyExhaustedEvent(accounts=report))
+                report[num] = f"reserve, {why}" if st.reserve else why
+                names[num] = self._account_label(num)
+            self._emit(PolicyExhaustedEvent(accounts=report, names=names))
             return TickOutcome.BLOCKED
         if not ordered:
             if not any_known:
@@ -2076,7 +2191,7 @@ class AutoSwitchEngine:
             if target.reserve:
                 self._emit(
                     ReserveInUseEvent(
-                        number=number, name=self._account_name(number)
+                        number=number, name=self._account_label(number)
                     )
                 )
         return outcome
@@ -2921,6 +3036,7 @@ class AutoSwitchEngine:
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
+                    to_label=self._account_label(number),
                 )
             )
             return TickOutcome.SWITCHED
@@ -2976,6 +3092,7 @@ class AutoSwitchEngine:
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
+                to_label=self._account_label(number),
             )
         )
         self._run_on_switch_hook(result, trigger)

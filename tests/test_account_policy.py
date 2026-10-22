@@ -246,7 +246,8 @@ class TestEnginePolicy:
         assert ph.tick_with_usage({"1": _u(10), "2": _u(29), "3": _u(0)}) \
             is TickOutcome.NO_ACTION
         [no] = _of(ph, NoSwitchEvent)
-        assert no.reason == "below-threshold" and "personal policy" in no.detail
+        assert no.reason == "below-personal-limit"
+        assert no.detail == "personal policy: 5h 29% / 30%, 7d 0% / 30%"
         [poll] = _of(ph, PollEvent)
         assert poll.personal_limits == {"5h": 30.0, "7d": 30.0}
         assert "personal limit 5h 30%" in poll.human()
@@ -279,7 +280,7 @@ class TestEnginePolicy:
         assert outcome is TickOutcome.SWITCHED
         assert ph.active_number() == 3
         [notice] = _of(ph, ReserveInUseEvent)
-        assert "Using reserve account Account-3" in notice.human()
+        assert "Using reserve account #3" in notice.human()
 
     def test_everything_blocked_holds_without_switching(self, ph):  # spec §12
         usage = {"1": _u(90), "2": _u(30), "3": _u(20)}
@@ -338,7 +339,7 @@ class TestEnginePolicy:
         ph.make_live("c@example.com", 3)
         assert ph.tick_with_usage({"1": _u(90), "2": _u(30), "3": _u(5)}) \
             is TickOutcome.NO_ACTION
-        assert _of(ph, NoSwitchEvent)[-1].reason == "reserve-in-use"
+        assert _of(ph, NoSwitchEvent)[-1].reason == "reserve-hold"
         ph.engine._mutate_state(lambda s: s.update(lastSwitchAt=ph.clock.now))
         assert ph.tick_with_usage({"1": _u(10), "2": _u(30), "3": _u(5)}) \
             is TickOutcome.NO_ACTION
@@ -356,7 +357,7 @@ class TestEnginePolicy:
         ph.switcher.set_alias("bee", "bravo")
         ph.tick_with_usage({"1": _u(10), "2": _u(30), "3": _u(0)})
         [limit] = _of(ph, PolicyLimitEvent)
-        assert limit.name == "Account-2 (bravo)"
+        assert limit.name == "#2 (bravo)"
 
     def test_consume_first_never_nudges_down_priority_or_to_reserve(self, ph):
         ph.settings = ph.settings.__class__(strategy="consume-first")

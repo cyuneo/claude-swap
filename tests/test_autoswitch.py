@@ -2178,7 +2178,8 @@ class TestEventsShape:
         harness.tick_with_usage({"1": _usage(42), "2": _usage(10), "3": None})
         poll = next(e for e in harness.events if isinstance(e, PollEvent))
         line = poll.human()
-        assert "Account-1" in line and "42% used" in line
+        assert line.startswith("#1: ") and "42% used" in line
+        assert "@" not in line
         # Others show per-window pcts, not just the ambiguous binding pct.
         assert "#2: 5h 10% · 7d 0%" in line
         assert "#3: ?" in line
@@ -7119,7 +7120,7 @@ class TestWeeklyThreshold:
         assert payload["headroomPct"]["1"] == 7.0                      # raw
         assert payload["threshold"] == 85.0
         assert payload["weeklyThreshold"] == 97.0
-        assert "Account-1 (a@example.com): 7d 93% used (switch at 97%)" in poll.human()
+        assert "#1: 7d 93% used (switch at 97%)" in poll.human()
         assert "#2: 5h 95% · 7d 47%" in poll.human()                   # raw
 
     def test_poll_event_omits_the_weekly_line_when_unset(self, temp_home):
