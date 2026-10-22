@@ -721,7 +721,22 @@ class TestUpstreamLineBridge:
     def test_poll_cadence_pins_to_lowest_personal_limit(self, ph):
         ph.tick_with_usage({"1": _u(10), "2": _u(5), "3": _u(0)})
         threshold, weekly, _models = ph.switcher._poll_inputs_override
-        assert (threshold, weekly) == (20.0, None)
+        assert (threshold, weekly) == (20.0, 20.0)
+
+    def test_low_5h_limit_does_not_tighten_the_7d_window(self, ph):
+        # max5h 5 / max7d at the line: the 7d window keeps its own line for
+        # collection and cadence instead of inheriting the 5h-only limit.
+        set_account_policy(
+            ph.switcher.backup_dir, "b@example.com", "", max_5h=5.0, max_7d=90.0
+        )
+        policy = load_policies(ph.switcher.backup_dir)
+        thresholds = ph.engine._resolve_thresholds()
+        assert ph.engine._personal_lines(policy, "2", thresholds, None) == (5.0, 90.0)
+        for email in ("a@example.com", "c@example.com"):
+            remove_account_policy(ph.switcher.backup_dir, email, "")
+        ph.tick_with_usage({"1": _u(10), "2": _u(3, 50), "3": _u(0)})
+        threshold, weekly, _models = ph.switcher._poll_inputs_override
+        assert (threshold, weekly) == (5.0, 90.0)
 
     def test_poll_cadence_unchanged_without_policy(self, ph):
         os.remove(ph.switcher.backup_dir / POLICY_FILENAME)

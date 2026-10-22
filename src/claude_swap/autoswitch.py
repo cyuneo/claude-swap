@@ -1224,8 +1224,11 @@ class AutoSwitchEngine:
         account departs at its personal limit (``policy-limit``), which can
         sit far below the switch line, so cadence pinned to the switch line
         alone would go urgent only at ``line - 15`` and let a 30% limit
-        overshoot for a whole active poll interval. With no weekly line one
-        number covers every window, so it is the tightest of them.
+        overshoot for a whole active poll interval. A policy account always
+        gets an explicit weekly line, even while ``weeklyThreshold`` is unset:
+        folding max5h and max7d into one number would hold the 7d window to a
+        low 5h-only limit (max5h 5 / max7d 98 would escalate collection and
+        go urgent on every tick while 7d sits far below 98).
         """
         line = thresholds[num]
         entry = None
@@ -1239,8 +1242,6 @@ class AutoSwitchEngine:
         seven = entry.max_7d if entry.max_7d is not None else weekly
         # Per-model windows never take max_7d: they keep the weekly line.
         week_lines = [seven, weekly] if self._models else [seven]
-        if weekly_threshold is None:
-            return min(five, *week_lines), None
         return five, min(week_lines)
 
     def _refresh_poll_policy_inputs(
@@ -1285,9 +1286,13 @@ class AutoSwitchEngine:
         ]
         if not pairs:
             pairs = [(self.settings.threshold, weekly)]
+        # A pair without a weekly line (no policy, no weeklyThreshold) holds
+        # its weekly windows to its 5h line, as window_line() does.
+        weeklies = [five if w is None else w for five, w in pairs]
+        any_weekly = weekly is not None or any(w is not None for _, w in pairs)
         self.switcher.set_poll_policy_inputs(
             min(five for five, _ in pairs),
-            None if weekly is None else min(w for _, w in pairs),
+            min(weeklies) if any_weekly else None,
             self._models,
         )
 
