@@ -57,6 +57,10 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Shell command run in the background after every automatic switch, with
+    # CSWAP_FROM / CSWAP_TO / CSWAP_TO_EMAIL / CSWAP_TRIGGER in its env
+    # (e.g. a script that re-attaches `claude remote-control`). None = off.
+    on_switch_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +138,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "onSwitchCommand", "on_switch_command", "string",
+            help="Command run in the background after each automatic switch",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

@@ -33,7 +33,9 @@ import enum
 import json
 import logging
 import math
+import os
 import random
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -43,6 +45,14 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
+from claude_swap.account_policy import (
+    AccountPolicyStatus,
+    PolicyTable,
+    all_policy_blocked,
+    candidate_tiers,
+    evaluate_account_policy,
+    load_policies,
+)
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -57,6 +67,17 @@ from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+
+# Triggers that are optimizations rather than escapes: they honor the
+# proactive cooldown. `policy-limit` is deliberately absent — a personal limit
+# is a hard constraint, so like `at-limit` it must not keep burning the
+# account through a cooldown. `reserve-return` (leave a reserve account once a
+# normal one qualifies again) and `schedule` (move onto an account whose own
+# time window is open) are optimizations and wait.
+_COOLDOWN_TRIGGERS = ("proactive", "consume-first", "reserve-return", "schedule")
+# Voluntary moves: never onto a reserve account, and they hold (NO_ACTION)
+# rather than report BLOCKED when nothing qualifies.
+_VOLUNTARY_POLICY_TRIGGERS = ("reserve-return", "schedule")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -314,6 +335,9 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Active account's personal 5h/7d limits (account_limits.json) when it has
+    # a policy, e.g. {"5h": 30.0, "7d": 30.0}. Additive field.
+    personal_limits: dict[str, float] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -325,6 +349,8 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.personal_limits:
+            fields["personalLimitsPct"] = self.personal_limits
         return fields
 
     def _describe(self, num: str) -> str:
@@ -353,9 +379,16 @@ class PollEvent(AutoSwitchEvent):
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
+        if self.personal_limits:
+            switch_at = "personal limit " + ", ".join(
+                f"{name} {pct_label(pct)}%"
+                for name, pct in self.personal_limits.items()
+            )
+        else:
+            switch_at = f"switch at {pct_label(self.threshold)}%"
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}"
+            f"({switch_at}){tail}"
         )
 
 
@@ -489,6 +522,61 @@ class ConfigWarningEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return f"warning: {self.message}"
+
+
+@dataclass(frozen=True)
+class PolicyLimitEvent(AutoSwitchEvent):
+    """The active account reached a PERSONAL limit (account_limits.json).
+
+    Deliberately distinct from an Anthropic rate limit: the account still
+    works, the user's own policy just stops treating it as usable."""
+
+    kind: ClassVar[str] = "policy-limit"
+    number: str
+    name: str
+    reason: str
+
+    def _fields(self) -> dict:
+        return {"number": self.number, "name": self.name, "reason": self.reason}
+
+    def human(self) -> str:
+        return (
+            f"{self.name}: {self.reason} "
+            "(personal policy, not an Anthropic rate limit); "
+            "selecting next eligible account"
+        )
+
+
+@dataclass(frozen=True)
+class PolicyExhaustedEvent(AutoSwitchEvent):
+    """Every candidate is at its personal limit: hold, never overrun one."""
+
+    kind: ClassVar[str] = "policy-exhausted"
+    # account number → human reason ("policy limit reached", ...)
+    accounts: dict[str, str] = field(default_factory=dict)
+
+    def _fields(self) -> dict:
+        return {"accounts": self.accounts}
+
+    def human(self) -> str:
+        lines = ["No account is available under your personal usage policy."]
+        lines += [f"    {name}: {why}" for name, why in self.accounts.items()]
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ReserveInUseEvent(AutoSwitchEvent):
+    """A switch landed on a reserve account (no normal account qualified)."""
+
+    kind: ClassVar[str] = "reserve-in-use"
+    number: str
+    name: str
+
+    def _fields(self) -> dict:
+        return {"number": self.number, "name": self.name}
+
+    def human(self) -> str:
+        return f"Using reserve account {self.name} (no normal account is available)"
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +772,9 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # account_limits.json warnings already reported (re-emitted only when
+        # the set changes, so a bad hand edit doesn't spam every tick).
+        self._policy_warnings_seen: tuple[str, ...] = ()
 
     # -- state file ---------------------------------------------------------
 
@@ -874,6 +965,86 @@ class AutoSwitchEngine:
             return False
         return slot_identity["uuid"] != ta_uuid
 
+    # -- personal policy (account_limits.json) --------------------------------
+
+    def _load_policy(self) -> PolicyTable:
+        """Re-read the policy file every tick so ``cswap policy set`` reaches a
+        running loop. Never raises (a bad file loads as empty + warnings)."""
+        table = load_policies(self.switcher.backup_dir)
+        if table.warnings and table.warnings != self._policy_warnings_seen:
+            for msg in table.warnings:
+                self._emit(ConfigWarningEvent(message=f"account_limits.json: {msg}"))
+        self._policy_warnings_seen = table.warnings
+        return table
+
+    def _policy_statuses(
+        self,
+        table: PolicyTable,
+        nums: Sequence[str],
+        usage: dict[str, dict | str | None],
+        threshold: float,
+    ) -> dict[str, AccountPolicyStatus]:
+        """Policy verdict per account, matched on the stable (email, org)
+        identity so alias renames and slot renumbering never lose a policy."""
+        statuses: dict[str, AccountPolicyStatus] = {}
+        for num in nums:
+            ident = self.switcher.account_identity(num)
+            statuses[num] = evaluate_account_policy(
+                table.get(ident["email"], ident["organizationUuid"]),
+                usage.get(num),
+                threshold,
+                self._models,
+                now=self.clock(),
+            )
+        return statuses
+
+    def _account_name(self, num: str) -> str:
+        alias = next(
+            (a for n, a, _ in self.switcher.list_aliases() if n == num), ""
+        )
+        return f"Account-{num} ({alias or self.switcher.account_email(num)})"
+
+    def _policy_hold(self, trigger: str) -> TickOutcome:
+        """A voluntary policy move found no target: staying is correct."""
+        if trigger == "schedule":
+            self._emit(
+                NoSwitchEvent(
+                    reason="scheduled-account-unavailable",
+                    detail="an account's time window is open but it cannot be "
+                    "switched to this tick",
+                )
+            )
+        else:
+            self._emit(
+                NoSwitchEvent(
+                    reason="reserve-in-use",
+                    detail="on a reserve account; no normal account is under "
+                    "its personal limit yet",
+                )
+            )
+        return TickOutcome.NO_ACTION
+
+    def _scheduled_account_ready(
+        self,
+        policy: PolicyTable,
+        current: str,
+        quarantined: set[str],
+        usage: dict[str, dict | str | None],
+        threshold: float,
+    ) -> bool:
+        """Is some other account inside its own time window and usable now?"""
+        others = [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n != current
+            and n not in quarantined
+            and self.switcher.account_kind_for(n) != "api_key"
+        ]
+        return any(
+            st.scheduled_now and st.known and not st.blocked and not st.reserve
+            for st in self._policy_statuses(policy, others, usage, threshold).values()
+        )
+
     # -- tick -----------------------------------------------------------------
 
     def tick(self) -> TickOutcome:
@@ -937,11 +1108,26 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        # Personal per-account policy. An empty table (no file, or no entries)
+        # leaves every decision below exactly as it was without the feature.
+        policy = self._load_policy()
+        active_policy: AccountPolicyStatus | None = None
+        if policy:
+            status = self._policy_statuses(
+                policy, [current], usage, settings.threshold
+            )[current]
+            if status.configured:
+                active_policy = status
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
+                personal_limits=(
+                    {"5h": active_policy.max_5h, "7d": active_policy.max_7d}
+                    if active_policy is not None
+                    else {}
+                ),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -977,27 +1163,67 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+            # An account with a personal policy is judged on its own 5h/7d
+            # limits (each window separately) instead of the global threshold.
+            if active_policy is not None:
+                below = not active_policy.blocked
+            else:
+                below = utilization < settings.threshold
+            if below:
+                if active_policy is not None and active_policy.reserve:
+                    # On a reserve account: hand back to a normal account as
+                    # soon as one qualifies (ranking only offers normal tiers
+                    # to this trigger), otherwise hold.
+                    trigger = "reserve-return"
+                elif (
+                    policy
+                    and not (
+                        active_policy is not None and active_policy.scheduled_now
+                    )
+                    and self._scheduled_account_ready(
+                        policy, current, quarantined, usage, settings.threshold
+                    )
+                ):
+                    # Another account's time window is open and it still has
+                    # room: that window is when it is meant to be used.
+                    trigger = "schedule"
+                elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
                             detail=(
-                                f"{pct_label(utilization)}% < "
+                                f"{active_policy.summary()} (personal policy)"
+                                if active_policy is not None
+                                else f"{pct_label(utilization)}% < "
                                 f"{pct_label(settings.threshold)}%"
                             ),
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets soonest,
+                    # to burn the most-perishable quota first. Candidate
+                    # selection decides whether a sooner-resetting account with
+                    # room actually exists.
+                    trigger = "consume-first"
+            elif active_headroom <= 0:
+                trigger = "at-limit"
+            elif active_policy is not None:
+                # Personal hard limit: an escape like at-limit (no hysteresis,
+                # no cooldown), but NOT an Anthropic rate limit — say so.
+                trigger = "policy-limit"
+                self._emit(
+                    PolicyLimitEvent(
+                        number=current,
+                        name=self._account_name(current),
+                        reason=active_policy.reason(),
+                    )
+                )
             else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                trigger = "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1046,7 +1272,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in _COOLDOWN_TRIGGERS and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1068,6 +1294,8 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
+        if trigger in _VOLUNTARY_POLICY_TRIGGERS and not oauth_candidates:
+            return self._policy_hold(trigger)
         if (
             trigger == "consume-first"
             and not oauth_candidates
@@ -1173,11 +1401,59 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
+        # Personal policy tiers: policy-blocked accounts dropped, then normal
+        # priority groups (ascending), then reserve groups. The existing
+        # ranking — gates, anti-flap bar and strategy key — runs unchanged on
+        # each group, and the first group that yields a target wins. Without a
+        # policy there is exactly one group, all OAuth candidates.
+        if active_policy is not None:
+            active_priority = active_policy.priority
+        elif policy:
+            active_priority = self._policy_statuses(
+                policy, [current], usage, settings.threshold
+            )[current].priority
+        else:
+            active_priority = None
+
+        def _rank_tiered(**kw):
+            if not policy:
+                return _rank(oauth_candidates=oauth_candidates, **kw)
+            statuses = self._policy_statuses(
+                policy, oauth_candidates, kw["usage"], settings.threshold
+            )
+            # Voluntary moves never go DOWN the priority order or onto a
+            # reserve account; escapes (policy-limit, at-limit, failover,
+            # proactive over the global threshold) may use every tier.
+            voluntary = trigger in ("consume-first", *_VOLUNTARY_POLICY_TRIGGERS)
+            tiers = candidate_tiers(
+                oauth_candidates,
+                statuses,
+                include_reserve=not voluntary,
+                only_scheduled=trigger == "schedule",
+                max_priority=(
+                    active_priority if trigger == "consume-first" else None
+                ),
+            )
+            any_known = any(
+                kw["headroom"].get(n) is not None for n in oauth_candidates
+            )
+            active_reset_ts = (
+                _seven_day_reset_ts(kw["usage"].get(current), kw["now"])
+                if consume_first
+                else None
+            )
+            for tier in tiers:
+                ordered, _known, active_reset_ts = _rank(
+                    oauth_candidates=tier, **kw
+                )
+                if ordered:
+                    return ordered, any_known, active_reset_ts
+            return [], any_known, active_reset_ts
+
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
+        ordered, any_known, active_reset_ts = _rank_tiered(
             trigger=trigger,
             consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
             usage=usage,
             headroom=headroom,
             current=current,
@@ -1186,7 +1462,13 @@ class AutoSwitchEngine:
             now=decided_now,
         )
 
-        if trigger == "consume-first" and ordered:
+        if (
+            trigger in ("consume-first", "policy-limit", *_VOLUNTARY_POLICY_TRIGGERS)
+            and ordered
+        ):
+            # The personal-policy triggers take the same two-phase commit:
+            # personal limits sit far below the global escalation band, so
+            # their provisional pick can ride equally stale candidate rows.
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1205,10 +1487,9 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
-            ordered, any_known, active_reset_ts = _rank(
+            ordered, any_known, active_reset_ts = _rank_tiered(
                 trigger=trigger,
                 consume_first=consume_first,
-                oauth_candidates=oauth_candidates,
                 usage=usage,
                 headroom=headroom,
                 current=current,
@@ -1217,12 +1498,51 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if (
+            not ordered
+            and api_key_candidates
+            and trigger not in ("consume-first", *_VOLUNTARY_POLICY_TRIGGERS)
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
 
+        if not ordered and trigger in _VOLUNTARY_POLICY_TRIGGERS:
+            return self._policy_hold(trigger)
+        if (
+            not ordered
+            and policy
+            and trigger != "consume-first"
+            and all_policy_blocked(
+                oauth_candidates,
+                self._policy_statuses(
+                    policy, oauth_candidates, usage, settings.threshold
+                ),
+            )
+        ):
+            # Every candidate is at its personal limit. Hold at the normal
+            # cadence — never overrun a personal limit, never loop — and let
+            # the next poll notice a window reset (blocks are recomputed from
+            # usage every tick, nothing is persisted).
+            report_statuses = self._policy_statuses(
+                policy, [current, *oauth_candidates], usage, settings.threshold
+            )
+            report: dict[str, str] = {}
+            for num, st in report_statuses.items():
+                if st.blocked:
+                    why = f"policy limit reached ({st.reason()})"
+                elif num == current and not st.known:
+                    why = "usage unknown"
+                elif num == current:
+                    why = "active"
+                else:
+                    continue
+                report[self._account_name(num)] = (
+                    f"reserve, {why}" if st.reserve else why
+                )
+            self._emit(PolicyExhaustedEvent(accounts=report))
+            return TickOutcome.BLOCKED
         if not ordered:
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
@@ -1313,7 +1633,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in ("consume-first", *_VOLUNTARY_POLICY_TRIGGERS):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1335,7 +1655,9 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform_noting_reserve(
+                    num, email, trigger, left_snapshot, policy, usage
+                )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1366,7 +1688,9 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform_noting_reserve(
+                num, email, trigger, left_snapshot, policy, usage
+            )
 
         if systemic or transient_failure:
             self._emit(
@@ -1380,6 +1704,29 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _perform_noting_reserve(
+        self,
+        number: str,
+        email: str,
+        trigger: str,
+        left: tuple[float | None, float],
+        policy: PolicyTable,
+        usage: dict[str, dict | str | None],
+    ) -> TickOutcome:
+        """``_perform``, plus a notice when the target is a reserve account."""
+        outcome = self._perform(number, email, trigger, left)
+        if outcome is TickOutcome.SWITCHED and policy:
+            target = self._policy_statuses(
+                policy, [number], usage, self.settings.threshold
+            )[number]
+            if target.reserve:
+                self._emit(
+                    ReserveInUseEvent(
+                        number=number, name=self._account_name(number)
+                    )
+                )
+        return outcome
 
     def _no_return_account(
         self,
@@ -2124,7 +2471,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in _COOLDOWN_TRIGGERS and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2169,7 +2516,44 @@ class AutoSwitchEngine:
                 warnings=result.get("warnings", []),
             )
         )
+        self._run_on_switch_hook(result, trigger)
         return TickOutcome.SWITCHED
+
+    def _run_on_switch_hook(self, result: dict, trigger: str) -> None:
+        """Start ``settings.on_switch_command`` detached after a real switch.
+
+        Fire-and-forget: the engine never waits on it (a cron ``--once`` tick
+        returns immediately) and a failure to start it is reported as a
+        warning, never as a failed switch.
+        """
+        command = self.settings.on_switch_command
+        if not command:
+            return
+        src = result.get("from") or {}
+        dst = result.get("to") or {}
+        env = {
+            **os.environ,
+            "CSWAP_FROM": str(src.get("number", "")),
+            "CSWAP_TO": str(dst.get("number", "")),
+            "CSWAP_TO_EMAIL": str(dst.get("email", "")),
+            "CSWAP_TRIGGER": trigger,
+        }
+        try:
+            subprocess.Popen(
+                command,
+                shell=True,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as e:
+            self._emit(
+                ConfigWarningEvent(
+                    message=f"autoswitch.onSwitchCommand could not start: {e}"
+                )
+            )
 
     # -- helpers --------------------------------------------------------------
 

@@ -575,6 +575,295 @@ Examples:
         sys.exit(130)
 
 
+def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
+    """One row per managed account (plus orphaned policy entries): effective
+    personal limits and the status the auto engine would see right now.
+
+    Usage comes from the local usage store only (``fetch=set()``) — no
+    network — so a row may show the last stored reading."""
+    import time
+
+    from claude_swap.account_policy import evaluate_account_policy, load_policies
+    from claude_swap.settings import load_settings, parse_model_names
+
+    root = switcher.backup_dir
+    settings = load_settings(root)
+    models = parse_model_names(settings.model)
+    table = load_policies(root)
+    for msg in table.warnings:
+        # stderr: keeps `policy list --json` stdout parseable.
+        warning(f"account_limits.json: {msg}", file=sys.stderr)
+    snapshot = switcher.accounts_snapshot(fetch=set())
+    rows: list[dict] = []
+    seen = set()
+    for acc in snapshot.accounts:
+        policy = table.get(acc.email, acc.org_uuid)
+        seen.add((acc.email, acc.org_uuid or ""))
+        st = evaluate_account_policy(
+            policy, acc.usage.decision_value(), settings.threshold, models,
+            now=time.time(),
+        )
+        window = st.blocking_window()
+        if acc.disabled:
+            status = "Disabled"
+        elif window is not None:
+            status = f"Policy-limit ({window.label})"
+        elif st.off_schedule:
+            status = "Off-schedule"
+        elif st.reserve:
+            status = "Reserve"
+        elif not st.known:
+            status = "Usage unknown"
+        else:
+            status = "Active" if acc.is_active else "Ready"
+        rows.append({
+            "number": acc.number,
+            "name": acc.alias or acc.email,
+            "email": acc.email,
+            "active": acc.is_active,
+            "configured": st.configured,
+            "max5h": st.max_5h,
+            "max7d": st.max_7d,
+            "priority": st.priority,
+            "reserve": st.reserve,
+            "schedule": list(st.schedule),
+            "enabled": not acc.disabled,
+            "usage5h": st.pct("5h"),
+            "usage7d": st.pct("7d"),
+            "status": status,
+            "reason": st.reason(),
+        })
+    for identity, policy in table.policies.items():
+        if identity not in seen:
+            rows.append({
+                "number": None, "name": policy.email, "email": policy.email,
+                "active": False, "configured": True,
+                "max5h": policy.max_5h, "max7d": policy.max_7d,
+                "priority": policy.priority, "reserve": policy.reserve,
+                "schedule": list(policy.schedule), "enabled": None, "usage5h": None, "usage7d": None,
+                "status": "Not managed", "reason": "",
+            })
+    return rows
+
+
+def _policy_command(argv: list[str]) -> None:
+    """Handle `cswap policy {list,show,set,enable,disable,remove,path}`.
+
+    Per-account personal usage limits for `cswap auto`, stored in
+    account_limits.json beside settings.json. Pre-dispatched before the main
+    parser for the same reason as `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap policy",
+        description=(
+            "Per-account personal usage limits for `cswap auto`. A personal "
+            "limit is your own ceiling on the 5h/7d utilization Claude "
+            "reports — not an Anthropic quota. Accounts without a policy use "
+            "autoswitch.threshold."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap policy set A --max-5h 90 --max-7d 90 --priority 1
+  cswap policy set B --max-5h 30 --max-7d 30 --priority 2
+  cswap policy set C --max-5h 20 --max-7d 20 --priority 3 --reserve
+  cswap policy set D --schedule 09:00-14:00      # only usable 09:00-14:00
+  cswap policy set D --schedule 22:00-02:00,12:00-13:00
+  cswap policy set D --schedule default          # usable at any time again
+  cswap policy set B --max-7d default      # back to autoswitch.threshold
+  cswap policy list
+  cswap policy disable B                   # same as `cswap disable B`
+  cswap policy remove B
+        """,
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(
+        dest="action", metavar="{list,show,set,enable,disable,remove,path}"
+    )
+    p_list = sub.add_parser("list", help="Show every account's policy and status (default)")
+    p_list.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    for name, help_text in (
+        ("show", "Show one account's policy and current status"),
+        ("enable", "Return an account to automatic selection"),
+        ("disable", "Hold an account out of automatic selection (manual switch still works)"),
+        ("remove", "Delete an account's policy (it falls back to the global threshold)"),
+    ):
+        sub.add_parser(name, help=help_text).add_argument(
+            "account", metavar="NUM|ALIAS|EMAIL"
+        )
+    p_set = sub.add_parser("set", help="Create or update an account's policy")
+    p_set.add_argument("account", metavar="NUM|ALIAS|EMAIL")
+    p_set.add_argument(
+        "--max-5h", metavar="PCT",
+        help="Personal 5h utilization limit, 1-100 ('default' clears it)",
+    )
+    p_set.add_argument(
+        "--max-7d", metavar="PCT",
+        help="Personal 7d utilization limit, 1-100 ('default' clears it)",
+    )
+    p_set.add_argument(
+        "--priority", metavar="N",
+        help="Lower is preferred (default 100; 'default' clears it)",
+    )
+    p_set.add_argument(
+        "--reserve", action=argparse.BooleanOptionalAction, default=None,
+        help="Reserve accounts are used only when no normal account qualifies",
+    )
+    p_set.add_argument(
+        "--schedule", metavar="HH:MM-HH:MM[,...]",
+        help=(
+            "Only use this account inside these local-time windows (preferred "
+            "there until it hits a limit); 'default' removes the restriction"
+        ),
+    )
+    sub.add_parser("path", help="Print the account_limits.json location")
+    args = parser.parse_args(argv)
+    action = args.action or "list"
+
+    import time
+
+    from claude_swap.account_policy import (
+        load_policies,
+        parse_limit,
+        parse_priority,
+        parse_schedule,
+        policy_path,
+        remove_account_policy,
+        set_account_policy,
+    )
+
+    def pct(value) -> str:
+        return "-" if value is None else f"{value:.10g}%"
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        root = switcher.backup_dir
+
+        if action == "path":
+            print(policy_path(root))
+        elif action == "list":
+            rows = _policy_rows(switcher)
+            if getattr(args, "json", False):
+                print(json.dumps(
+                    {"schemaVersion": 1, "path": str(policy_path(root)),
+                     "accounts": rows},
+                    indent=2,
+                ))
+                return
+            if not rows:
+                print(dimmed("No accounts are managed yet"))
+                return
+            headers = ("ACCOUNT", "5H LIMIT", "7D LIMIT", "PRIORITY",
+                       "RESERVE", "SCHEDULE", "USAGE 5H/7D", "STATUS")
+            table = []
+            for r in rows:
+                label = f"{r['number']}: {r['name']}" if r["number"] else r["name"]
+                table.append((
+                    ("* " if r["active"] else "  ") + label,
+                    pct(r["max5h"]),
+                    pct(r["max7d"]),
+                    "-" if r["priority"] is None else str(r["priority"]),
+                    "Yes" if r["reserve"] else "No",
+                    ",".join(r["schedule"]) or "any",
+                    f"{pct(r['usage5h'])} / {pct(r['usage7d'])}",
+                    r["status"] if r["configured"] else f"{r['status']} (default)",
+                ))
+            widths = [max(len(h), *(len(t[i]) for t in table))
+                      for i, h in enumerate(headers)]
+            print(bolded("  ".join(h.ljust(w) for h, w in zip(headers, widths))))
+            for t in table:
+                print("  ".join(c.ljust(w) for c, w in zip(t, widths)).rstrip())
+            print(dimmed(
+                "(default) = no policy: limits follow autoswitch.threshold. "
+                "Usage is the last stored reading. Schedules use this "
+                f"machine's local time (now {time.strftime('%H:%M %Z')})."
+            ))
+        elif action == "show":
+            num, email, org = switcher.resolve_account(args.account)
+            row = next(r for r in _policy_rows(switcher) if r["number"] == num)
+            print(bolded(f"Account-{num} ({row['name']})"))
+            source = "account_limits.json" if row["configured"] else \
+                "autoswitch.threshold (no policy)"
+            print(f"  5h: {pct(row['usage5h'])} / limit {pct(row['max5h'])}")
+            print(f"  7d: {pct(row['usage7d'])} / limit {pct(row['max7d'])}")
+            print(f"  Schedule: {', '.join(row['schedule']) or 'any time'}"
+                  f" (local time, now {time.strftime('%H:%M %Z')})")
+            print(f"  Priority: {row['priority']}   Reserve: "
+                  f"{'Yes' if row['reserve'] else 'No'}   Enabled: "
+                  f"{'Yes' if row['enabled'] else 'No'}")
+            print(f"  Status: {row['status']}"
+                  + (f" — {row['reason']}" if row["reason"] else ""))
+            print(dimmed(f"  Limits from: {source}"))
+        elif action == "set":
+            updates: dict = {}
+            for attr, flag in (("max_5h", "--max-5h"), ("max_7d", "--max-7d")):
+                raw = getattr(args, attr)
+                if raw is not None:
+                    updates[attr] = (
+                        None if raw.lower() == "default" else parse_limit(raw, flag)
+                    )
+            if args.priority is not None:
+                updates["priority"] = (
+                    None if args.priority.lower() == "default"
+                    else parse_priority(args.priority)
+                )
+            if args.reserve is not None:
+                updates["reserve"] = args.reserve
+            if args.schedule is not None:
+                updates["schedule"] = (
+                    None if args.schedule.lower() == "default"
+                    else parse_schedule(args.schedule)
+                )
+            if not updates:
+                parser.error(
+                    "set needs at least one of --max-5h, --max-7d, --priority, "
+                    "--reserve/--no-reserve, --schedule"
+                )
+            num, email, org = switcher.resolve_account(args.account)
+            policy = set_account_policy(root, email, org, **updates)
+            parts = [
+                f"5h {pct(policy.max_5h) if policy.max_5h else 'default'}",
+                f"7d {pct(policy.max_7d) if policy.max_7d else 'default'}",
+                f"priority {policy.priority if policy.priority is not None else 'default'}",
+            ] + (["reserve"] if policy.reserve else []) + (
+                [f"schedule {','.join(policy.schedule)}"] if policy.schedule else []
+            )
+            print(f"{accent('Set policy')} for Account-{num} ({email}): "
+                  + ", ".join(parts))
+        elif action in ("enable", "disable"):
+            # One source of truth: the existing rotation flag in sequence.json.
+            switcher.set_account_disabled(args.account, action == "disable")
+        elif action == "remove":
+            try:
+                num, email, org = switcher.resolve_account(args.account)
+                identities = [(email, org)]
+            except ClaudeSwitchError:
+                # The account may be gone already; match orphaned entries by email.
+                num = None
+                identities = [
+                    ident for ident in load_policies(root).policies
+                    if ident[0] == args.account
+                ]
+                if not identities:
+                    raise
+            removed = [remove_account_policy(root, e, o) for e, o in identities]
+            label = f"Account-{num}" if num else args.account
+            if any(removed):
+                print(f"{accent('Removed policy')} for {label}; it now follows "
+                      "autoswitch.threshold")
+            else:
+                print(muted(f"{label} has no policy; nothing to do"), file=sys.stderr)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -698,7 +987,10 @@ Defaults live in settings.json in the backup root; flags override them.
         line = event.human()
         if event.kind == "switch":
             line = accent(line)
-        elif event.kind in ("error", "account-quarantined"):
+        elif event.kind in (
+            "error", "account-quarantined",
+            "policy-limit", "policy-exhausted", "reserve-in-use",
+        ):
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
@@ -1012,6 +1304,9 @@ def main() -> None:
         return
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
+        return
+    if argv and argv[0] == "policy":
+        _policy_command(argv[1:])
         return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
