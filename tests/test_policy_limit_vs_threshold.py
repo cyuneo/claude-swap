@@ -322,6 +322,40 @@ class TestSettingsReload:
         assert reloaded.threshold == 70.0  # from the file
         assert reloaded.interval_seconds == 30.0  # the CLI flag still wins
 
+    def test_malformed_file_keeps_current_settings(self, th):
+        from claude_swap.autoswitch import ConfigWarningEvent
+
+        _write_settings(th, {"threshold": 50}, 1_000_000)
+        root = th.switcher.backup_dir
+        self._engine(th)
+        th.engine.settings = load_settings(root)
+        path = settings_path(root)
+        path.write_text("{half written")
+        os.utime(path, (1_000_100, 1_000_100))
+        th.tick_with_usage({"1": _u(10), "2": _u(40), "3": _u(0)})
+        assert th.engine.settings.threshold == 50.0  # not the 90 default
+        assert not _of(th, SettingsReloadedEvent)
+        assert len(_of(th, ConfigWarningEvent)) == 1
+        # Fixed later: the next mtime change reloads normally.
+        _write_settings(th, {"threshold": 60}, 1_000_200)
+        th.tick_with_usage({"1": _u(10), "2": _u(40), "3": _u(0)})
+        assert th.engine.settings.threshold == 60.0
+
+    def test_malformed_file_never_ends_a_pause(self, th):
+        _write_settings(th, {"pausedUntil": "forever"}, 1_000_000)
+        usage = {"1": _u(10), "2": _u(99), "3": _u(0)}
+        assert th.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        settings_path(th.switcher.backup_dir).write_text("{half written")
+        th.events.clear()
+        assert th.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert [e.reason for e in _of(th, NoSwitchEvent)] == ["paused"]
+
+    def test_far_future_pause_is_a_pause_not_an_error(self, th):
+        _write_settings(th, {"pausedUntil": 1e20}, 1_000_000)
+        usage = {"1": _u(10), "2": _u(99), "3": _u(0)}
+        assert th.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert [e.reason for e in _of(th, NoSwitchEvent)] == ["paused"]
+
 
 # ---------------------------------------------------------------------------
 # `cswap policy list`: state, blockedWindow, limit sources, wording

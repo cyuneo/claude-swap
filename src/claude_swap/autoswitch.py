@@ -305,7 +305,14 @@ def _now_iso() -> str:
 def _pause_detail(paused_until: float | str) -> str:
     if paused_until == "forever":
         return "until resumed (cswap auto --resume)"
-    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(paused_until)))
+    try:
+        stamp = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(float(paused_until))
+        )
+    except (OverflowError, ValueError, OSError):
+        # A far-future epoch (hand-set) is still a pause; never fail a tick
+        # over its display.
+        stamp = f"epoch {float(paused_until):.0f}"
     return f"until {stamp} (cswap auto --resume to end early)"
 
 
@@ -1179,6 +1186,17 @@ class AutoSwitchEngine:
         if mtime == self._settings_mtime:
             return
         self._settings_mtime = mtime
+        if not self._settings_file_ok():
+            # load_settings would turn a half-written or hand-broken file
+            # into all defaults; keep the values in use until it parses.
+            _logger.warning("settings.json is not valid JSON; keeping current")
+            self._emit(
+                ConfigWarningEvent(
+                    message="settings.json could not be parsed; keeping the "
+                    "settings in use until it is fixed"
+                )
+            )
+            return
         try:
             new = self._settings_loader()
         except Exception as e:
@@ -1191,6 +1209,19 @@ class AutoSwitchEngine:
             self._model_check_done = not self._models
         self.settings = new
         self._emit(SettingsReloadedEvent(settings=new))
+
+    def _settings_file_ok(self) -> bool:
+        """settings.json is absent or a JSON object (a malformed file would
+        load as all defaults)."""
+        try:
+            raw = json.loads(
+                settings_path(self.switcher.backup_dir).read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            return True
+        except (OSError, ValueError):
+            return False
+        return isinstance(raw, dict)
 
     # -- personal policy (account_limits.json) --------------------------------
 
@@ -3319,9 +3350,14 @@ class AutoSwitchEngine:
         every tick (so `cswap auto --pause/--resume` reach a running loop
         even without a settings loader). None = not paused."""
         try:
-            value = load_settings(self.switcher.backup_dir).paused_until
+            if self._settings_file_ok():
+                value = load_settings(self.switcher.backup_dir).paused_until
+            else:
+                # Unreadable file: keep the pause last seen, never resume
+                # (or pause) on a half-written settings.json.
+                value = self._paused_until
         except Exception:
-            value = self.settings.paused_until
+            value = self._paused_until
         if value is None:
             return None  # the common case reads no clock
         return value if pause_active(value, self.clock()) else None

@@ -296,7 +296,7 @@ class TestPauseCli:
         monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", boom)
         self._auto(["--pause", "30m"], capsys)
 
-    @pytest.mark.parametrize("bad", ["soon", "0", "-2h"])
+    @pytest.mark.parametrize("bad", ["soon", "0", "-2h", "1e14d"])
     def test_bad_duration_errors(self, temp_home, capsys, bad):
         with pytest.raises(SystemExit) as exc:
             self._auto(["--pause", bad], capsys)

@@ -1486,11 +1486,12 @@ def _pause_command(parser: argparse.ArgumentParser, args) -> None:
             print(f"{accent('Auto-switch paused')} until `cswap auto --resume`")
             return
         until = _time.time() + seconds
+        try:
+            stamp = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(until))
+        except (OverflowError, ValueError, OSError):
+            parser.error(f"duration too long: '{args.pause}'")
         set_setting(root, "autoswitch.pausedUntil", repr(round(until, 3)))
-        print(
-            f"{accent('Auto-switch paused')} until "
-            f"{_time.strftime('%Y-%m-%d %H:%M', _time.localtime(until))}"
-        )
+        print(f"{accent('Auto-switch paused')} until {stamp}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
