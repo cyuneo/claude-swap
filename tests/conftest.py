@@ -724,6 +724,13 @@ def _deterministic_poll_jitter(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_fsync(monkeypatch):
+    """Durability is not under test, and one real fsync per atomic write is
+    most of the suite's I/O. Tests that inject at fsync patch over this."""
+    monkeypatch.setattr(os, "fsync", lambda fd: None)
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_colour(monkeypatch):
     """A developer's terminal must not decide whether the suite passes.
 

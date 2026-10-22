@@ -452,25 +452,29 @@ def evaluate_account_policy(
     threshold: float,
     models: Sequence[str] = (),
     now: float | None = None,
+    weekly_threshold: float | None = None,
 ) -> AccountPolicyStatus:
     """Measure one usage reading against an account's personal limits.
 
     5h and 7d are checked independently against ``max_5h`` / ``max_7d`` (never
-    folded into one binding number, so either window alone can block). Scoped
-    per-model windows (``autoswitch.model``) keep the global threshold. Any
-    limit the policy leaves unset falls back to ``threshold``. ``now`` (epoch
-    seconds, read as local time) is checked against the policy's schedule;
-    ``None`` skips the schedule check.
+    folded into one binding number, so either window alone can block). Any
+    limit the policy leaves unset falls back to the engine's own line for that
+    window (``lines.window_line``): ``threshold`` for 5h, and
+    ``weekly_threshold`` — when one is configured, else ``threshold`` — for 7d
+    and the scoped per-model windows (``autoswitch.model``), which never take
+    ``max_7d``. ``now`` (epoch seconds, read as local time) is checked against
+    the policy's schedule; ``None`` skips the schedule check.
     """
     schedule = policy.schedule if policy else ()
     off_schedule = bool(schedule) and now is not None and not in_schedule(
         schedule, datetime.fromtimestamp(now)
     )
+    weekly = threshold if weekly_threshold is None else weekly_threshold
     max_5h = policy.max_5h if policy and policy.max_5h is not None else threshold
-    max_7d = policy.max_7d if policy and policy.max_7d is not None else threshold
+    max_7d = policy.max_7d if policy and policy.max_7d is not None else weekly
     limits = {"5h": max_5h, "7d": max_7d}
     windows = tuple(
-        PolicyWindow(label, pct, limits.get(label, threshold))
+        PolicyWindow(label, pct, limits.get(label, weekly))
         for label, pct, _ in oauth.relevant_windows(
             usage if isinstance(usage, dict) else None, models
         )

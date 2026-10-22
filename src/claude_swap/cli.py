@@ -11,6 +11,7 @@ import sys
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
+from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
 from claude_swap.printer import (
     accent,
     bolded,
@@ -20,7 +21,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
-from claude_swap.settings import load_ui_settings
+from claude_swap.settings import load_ui_settings, load_update_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -148,7 +149,7 @@ Examples:
         "--no-share",
         action="store_true",
         help=(
-            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents "
+            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
             "from ~/.claude into the session profile (and remove previously "
             "shared items)"
         ),
@@ -575,6 +576,115 @@ Examples:
         sys.exit(130)
 
 
+def _threshold_command(argv: list[str]) -> None:
+    """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
+
+    With no arguments, prints the global `autoswitch.threshold` and every
+    per-account override. Otherwise sets (or, with --unset, removes) one
+    account's own switch-away threshold. Pre-dispatched before the main parser
+    for the same reason as `alias`: the main parser's required
+    mutually-exclusive group cannot hold a positional subcommand.
+
+    The value is validated inside `set_account_threshold`, before any file is
+    touched, so a rejected value leaves `sequence.json` byte-identical.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap threshold",
+        description=(
+            "Set, remove, or list a per-account switch-away threshold. The "
+            "per-account value replaces autoswitch.threshold for that account "
+            "only, so one shared account can reserve headroom without capping "
+            "the whole fleet."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  cswap threshold 2 85
+  cswap threshold user@example.com 99.9
+  cswap threshold 2 --unset           # back to the global default
+  cswap threshold                     # list the global default and overrides
+
+Valid range: {ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g} (percent used).
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to set (number, email, or alias). Omit to list.",
+    )
+    parser.add_argument(
+        "threshold",
+        nargs="?",
+        metavar="PCT",
+        help=(
+            f"Percent used at which to switch away "
+            f"({ACCOUNT_THRESHOLD_MIN:g}-{ACCOUNT_THRESHOLD_MAX:g})."
+        ),
+    )
+    parser.add_argument(
+        "--unset", action="store_true", help="Remove the account's override"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.threshold:
+        parser.error("--unset does not take a PCT argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
+    if args.account is not None and not args.unset and args.threshold is None:
+        parser.error("PCT is required (or pass --unset to remove the override)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            _print_threshold_table(switcher)
+            return
+
+        switcher.set_account_threshold(
+            args.account, None if args.unset else args.threshold
+        )
+    except ValueError as e:
+        # normalize_account_threshold's message; it always names the range.
+        error(f"Error: {e}")
+        sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
+    """Print the global switch-away threshold and every per-account override.
+
+    The global line is printed unconditionally: an operator reading a list of
+    overrides needs to know what the accounts *without* one are using.
+    """
+    from claude_swap.settings import load_settings
+
+    default = load_settings(switcher.backup_dir).threshold
+    print(bolded("Switch-away thresholds:"))
+    print(f"  {dimmed('global default')}  {default:g}%")
+
+    rows = sorted(
+        (
+            (num, policy.threshold)
+            for num, policy in switcher.account_policies().items()
+            if policy.threshold is not None
+        ),
+        key=lambda row: (not row[0].isdigit(), int(row[0]) if row[0].isdigit() else 0),
+    )
+    if not rows:
+        print(dimmed("  No per-account overrides set"))
+        return
+    for num, value in rows:
+        print(f"  Account-{num}  {value:g}%")
+
+
 def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
     """One row per managed account (plus orphaned policy entries): effective
     personal limits and the status the auto engine would see right now.
@@ -599,9 +709,17 @@ def _policy_rows(switcher: ClaudeAccountSwitcher) -> list[dict]:
     for acc in snapshot.accounts:
         policy = table.get(acc.email, acc.org_uuid)
         seen.add((acc.email, acc.org_uuid or ""))
+        # Unset limits fall back to the lines the engine uses for this
+        # account: its `cswap threshold` override (else autoswitch.threshold)
+        # for 5h, autoswitch.weeklyThreshold (else that line) for 7d.
+        line = (
+            acc.policy.threshold
+            if acc.policy is not None and acc.policy.threshold is not None
+            else settings.threshold
+        )
         st = evaluate_account_policy(
-            policy, acc.usage.decision_value(), settings.threshold, models,
-            now=time.time(),
+            policy, acc.usage.decision_value(), line, models,
+            now=time.time(), weekly_threshold=settings.weekly_threshold,
         )
         window = st.blocking_window()
         if acc.disabled:
@@ -777,7 +895,9 @@ Examples:
             for t in table:
                 print("  ".join(c.ljust(w) for c, w in zip(t, widths)).rstrip())
             print(dimmed(
-                "(default) = no policy: limits follow autoswitch.threshold. "
+                "(default) = no policy: limits follow the switch lines "
+                "(cswap threshold / autoswitch.threshold, "
+                "autoswitch.weeklyThreshold for 7d). "
                 "Usage is the last stored reading. Schedules use this "
                 f"machine's local time (now {time.strftime('%H:%M %Z')})."
             ))
@@ -893,8 +1013,9 @@ Exit codes with --once:
   3  blocked: wanted to switch but no viable target / all exhausted
 
 Examples:
-  cswap auto                       # foreground loop, switch at 90%% used
+  cswap auto                       # foreground loop, switch at 90% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --weekly-threshold 97 # let the weekly window run higher before switching
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -924,8 +1045,19 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "Switch when the active account's 5h window (or any window, "
+            "without a weekly line) reaches this utilization (50-99.9; "
+            "default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--weekly-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Separate switch line for the 7-day and per-model weekly windows "
+            "(50-99.9; default: the threshold). A flag cannot unset a "
+            "configured value; use 'cswap config unset'"
         ),
     )
     parser.add_argument(
@@ -975,7 +1107,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -1017,10 +1149,15 @@ Defaults live in settings.json in the backup root; flags override them.
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            weekly = (
+                f", weekly {pct_label(settings.weekly_threshold)}%"
+                if settings.weekly_threshold is not None
+                else ""
+            )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
-                    f"every {settings.interval_seconds:.0f}s"
+                    f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
+                    f"{weekly}, every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
@@ -1077,6 +1214,7 @@ Examples:
   cswap config                              # list effective settings
   cswap config get autoswitch.threshold
   cswap config set autoswitch.threshold 80
+  cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
   cswap config unset autoswitch.threshold   # back to the default
   cswap config path                         # where settings.json lives
         """,
@@ -1305,6 +1443,9 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "threshold":
+        _threshold_command(argv[1:])
+        return
     if argv and argv[0] == "policy":
         _policy_command(argv[1:])
         return
@@ -1342,6 +1483,9 @@ Commands:
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
+  %(prog)s threshold <num|email> <pct>  set one account's switch-away point
+  %(prog)s threshold <num|email> --unset  clear it (use the global default)
+  %(prog)s threshold                  list the global default and overrides
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account
@@ -1805,8 +1949,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
-    # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade and not args.json:
+    # in case the dispatch is later refactored to fall through. Skipped when
+    # `updates.check` is false, so no request goes to PyPI at all.
+    if (
+        not args.purge
+        and not args.upgrade
+        and not args.json
+        and load_update_settings(paths.get_backup_root()).check
+    ):
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)

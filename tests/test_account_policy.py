@@ -381,7 +381,7 @@ class TestEngineWithoutPolicy:
         set_account_policy(ph.switcher.backup_dir, "c@example.com", "", reserve=True)
         ph.tick_with_usage({"1": _u(0), "2": _u(50), "3": _u(0)})
         [no] = _of(ph, NoSwitchEvent)
-        assert no.detail == "50% < 90%"
+        assert no.detail == "5h 50% < 90%"
         ph.events.clear()
         ph.tick_with_usage({"1": _u(0), "2": _u(91), "3": _u(0)})
         [sw] = _of(ph, SwitchEvent)
@@ -393,7 +393,7 @@ class TestEngineWithoutPolicy:
             assert ph.tick_with_usage({"1": _u(0), "2": _u(30), "3": _u(0)}) \
                 is TickOutcome.NO_ACTION
         # Plain threshold semantics (30% < 90%), and the warning is not spammed.
-        assert _of(ph, NoSwitchEvent)[-1].detail == "30% < 90%"
+        assert _of(ph, NoSwitchEvent)[-1].detail == "5h 30% < 90%"
         assert len(_of(ph, ConfigWarningEvent)) == 1
 
 
@@ -683,3 +683,84 @@ class TestOnSwitchHook:
         ph.tick_with_usage({"1": _u(10), "2": _u(5), "3": _u(0)})  # below limit
         time.sleep(0.5)
         assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# Bridge to upstream's per-account / weekly switch lines (#318, #474)
+# ---------------------------------------------------------------------------
+
+
+class TestUpstreamLineBridge:
+    def test_unset_7d_falls_back_to_weekly_threshold(self):
+        st = evaluate_account_policy(
+            AccountPolicy("b@x", max_5h=30), _u(5, 95), 90.0, weekly_threshold=97.0
+        )
+        assert (st.max_5h, st.max_7d) == (30.0, 97.0) and not st.blocked
+        st = evaluate_account_policy(None, _u(5, 95), 90.0, weekly_threshold=97.0)
+        assert (st.max_5h, st.max_7d) == (90.0, 97.0) and not st.blocked
+
+    def test_scoped_window_follows_weekly_line_not_max_7d(self):
+        usage = _u(5, 5) | {"scoped": [{"name": "Fable", "pct": 95.0}]}
+        st = evaluate_account_policy(
+            AccountPolicy("b@x", max_7d=50), usage, 90.0, ("Fable",),
+            weekly_threshold=97.0,
+        )
+        assert not st.blocked
+
+    def test_unconfigured_candidate_uses_its_own_threshold_override(self, ph):
+        # A has no policy but `cswap threshold 1 95`: at 92% it is a valid
+        # landing spot under its own line, so B's personal limit moves to A
+        # rather than falling through to the reserve account C.
+        remove_account_policy(ph.switcher.backup_dir, "a@example.com", "")
+        ph.switcher.set_account_threshold("1", 95)
+        outcome = ph.tick_with_usage({"1": _u(92), "2": _u(31), "3": _u(0)})
+        assert outcome is TickOutcome.SWITCHED
+        [sw] = _of(ph, SwitchEvent)
+        assert sw.trigger == "policy-limit" and sw.to_ref["number"] == 1
+
+    def test_poll_cadence_pins_to_lowest_personal_limit(self, ph):
+        ph.tick_with_usage({"1": _u(10), "2": _u(5), "3": _u(0)})
+        threshold, weekly, _models = ph.switcher._poll_inputs_override
+        assert (threshold, weekly) == (20.0, None)
+
+    def test_poll_cadence_unchanged_without_policy(self, ph):
+        os.remove(ph.switcher.backup_dir / POLICY_FILENAME)
+        ph.tick_with_usage({"1": _u(10), "2": _u(5), "3": _u(0)})
+        threshold, weekly, _models = ph.switcher._poll_inputs_override
+        assert (threshold, weekly) == (90.0, None)
+
+
+class TestPolicyListFollowsUpstreamLines:
+    def test_list_json_uses_threshold_override_and_weekly_line(
+        self, temp_home, capsys
+    ):
+        from unittest.mock import patch
+
+        from claude_swap import cli
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        for num, email in (("1", "a@co.com"), ("2", "b@co.com")):
+            data["accounts"][num] = {
+                "email": email, "uuid": f"u{num}", "organizationUuid": "",
+                "organizationName": "", "added": "2024-01-01T00:00:00Z",
+            }
+        data["sequence"] = [1, 2]
+        switcher._write_json(switcher.sequence_file, data)
+        (switcher.backup_dir / "settings.json").write_text(
+            json.dumps({"autoswitch": {"weeklyThreshold": 97}})
+        )
+        with patch("os.geteuid", return_value=1000, create=True):
+            switcher.set_account_threshold("1", 85)
+            cli._policy_command(["set", "2", "--max-5h", "30"])
+            capsys.readouterr()
+            cli._policy_command(["list", "--json"])
+        doc = json.loads(capsys.readouterr().out)
+        assert doc["schemaVersion"] == 1
+        rows = {r["number"]: r for r in doc["accounts"]}
+        assert (rows["1"]["max5h"], rows["1"]["max7d"]) == (85.0, 97.0)
+        assert (rows["2"]["max5h"], rows["2"]["max7d"]) == (30.0, 97.0)
+        assert not rows["1"]["configured"] and rows["2"]["configured"]
