@@ -4,35 +4,23 @@ Multi-account switcher for Claude Code. Easily switch between multiple Claude ac
 
 ## Installation
 
-### Using uv (recommended)
+This is a separately maintained version of claude-swap: personal limits (`cswap policy`), auto-switch status and pause, and a hook that runs after every switch. Install it from the cswap-suite bundle, not from PyPI: `claude-swap` on PyPI is the original project, which has none of these.
 
 ```bash
-uv tool install claude-swap
+tar xzf cswap-suite.tar.gz && ./cswap-suite/install.sh   # cswap and the companion tools
 ```
 
-### Using pipx
+Only cswap, from this folder:
 
 ```bash
-pipx install claude-swap
+uv tool install --force .
 ```
 
-### From source
-
-```bash
-git clone https://github.com/realiti4/claude-swap.git
-cd claude-swap
-uv sync
-uv run cswap help
-```
+For development: `uv sync`, then `uv run cswap help` and `uv run pytest -q`.
 
 ### Updating
 
-```bash
-cswap upgrade          # uv/pipx installs on macOS/Linux: auto-detects and upgrades
-# or run your installer directly:
-uv tool upgrade claude-swap
-pipx upgrade claude-swap
-```
+Install a newer bundle, or run `uv tool install --force .` here again. `cswap upgrade` reinstalls from wherever cswap was installed from; it never fetches the original project from PyPI.
 
 ## Usage
 
@@ -261,7 +249,7 @@ On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 Needs the `menubar` extra (macOS only):
 
 ```bash
-uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
+uv tool install --force '.[menubar]'   # in this folder
 cswap menubar
 ```
 
