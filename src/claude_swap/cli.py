@@ -1389,9 +1389,13 @@ Defaults live in settings.json in the backup root; flags override them.
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
 
+    repeated = QuietRepeats()
+
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
         line = event.human()
+        if not repeated.should_print(event.kind, line):
+            return
         if event.kind == "switch":
             line = accent(line)
         elif event.kind in (
@@ -1744,6 +1748,33 @@ def _menubar_service(args) -> int:
     if not result["installed"]:
         print(dimmed("launchd still has it loaded, but the plist is gone."))
     return 0
+
+
+class QuietRepeats:
+    """The human `cswap auto` log, quieter: a routine line (the usage poll,
+    "no switch", the sleep) that says exactly what the last one of its kind
+    said is left out, except once every ``every`` seconds as a heartbeat.
+    Switches, errors and anything that changed always print; --json is never
+    filtered."""
+
+    QUIET_KINDS = frozenset(("poll", "no-switch", "sleep"))
+
+    def __init__(self, every: float = 1800.0, clock=None) -> None:
+        import time
+
+        self.every = every
+        self.clock = clock or time.monotonic
+        self._last: dict[str, tuple[str, float]] = {}
+
+    def should_print(self, kind: str, text: str) -> bool:
+        if kind not in self.QUIET_KINDS:
+            return True
+        now = self.clock()
+        last = self._last.get(kind)
+        if last is not None and last[0] == text and now - last[1] < self.every:
+            return False
+        self._last[kind] = (text, now)
+        return True
 
 
 def main() -> None:

@@ -536,3 +536,33 @@ class TestCliSurface:
         assert "policy list" in out
         assert "auto --pause" in out and "auto --resume" in out
         assert "threshold <num|email>" not in out
+
+
+class TestQuietRepeats:
+    """The human `cswap auto` log leaves out a routine line that repeats."""
+
+    def test_repeats_are_dropped_until_the_heartbeat(self):
+        from claude_swap.cli import QuietRepeats
+
+        now = [0.0]
+        q = QuietRepeats(every=1800.0, clock=lambda: now[0])
+        assert q.should_print("no-switch", "no switch: paused")
+        now[0] = 60
+        assert not q.should_print("no-switch", "no switch: paused")
+        assert q.should_print("poll", "#1: 5h 76% used")  # another kind
+        now[0] = 120
+        assert q.should_print("no-switch", "no switch: below threshold")  # changed
+        now[0] = 180
+        assert q.should_print("no-switch", "no switch: paused")  # changed back
+        now[0] = 180 + 1799
+        assert not q.should_print("no-switch", "no switch: paused")
+        now[0] = 180 + 1800
+        assert q.should_print("no-switch", "no switch: paused")  # heartbeat
+
+    def test_switches_and_errors_always_print(self):
+        from claude_swap.cli import QuietRepeats
+
+        q = QuietRepeats(clock=lambda: 0.0)
+        for kind in ("switch", "error", "policy-limit"):
+            assert q.should_print(kind, "same")
+            assert q.should_print(kind, "same")
