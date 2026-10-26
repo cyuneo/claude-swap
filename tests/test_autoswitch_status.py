@@ -419,7 +419,7 @@ class TestPolicyListAutoswitch:
             "threshold", "weeklyThreshold", "intervalSeconds", "cooldownSeconds",
             "hysteresisPct", "strategy", "pausedUntil", "settingsMtime",
             "lastSwitch", "cooldownUntil", "nextCandidate", "excluded",
-            "service", "history",
+            "service", "history", "manualHoldUntil", "manualHoldSeconds",
         }
         assert block["threshold"] == 98.0 and block["pausedUntil"] is None
         assert isinstance(block["settingsMtime"], float)
@@ -477,6 +477,21 @@ class TestPolicyListAutoswitch:
         assert block["cooldownUntil"] == pytest.approx(now + 200)
         assert block["pausedUntil"] == "forever"
         assert "@" not in json.dumps(block)
+
+    def test_manual_hold_only_for_a_manual_switch_onto_the_active(self, fleet, capsys):
+        root = fleet.switcher.backup_dir
+        now = time.time()
+        append_history(root, from_number=1, to_number=3, trigger="manual", at=now - 10)
+        block = self._doc(capsys)["autoswitch"]
+        assert block["manualHoldSeconds"] == 7200.0
+        assert block["manualHoldUntil"] == pytest.approx(now - 10 + 7200)
+        append_history(root, from_number=3, to_number=1, trigger="manual", at=now - 5)
+        assert self._doc(capsys)["autoswitch"]["manualHoldUntil"] is None  # #1 is not active
+        append_history(root, from_number=1, to_number=3, trigger="reserve-return", at=now)
+        assert self._doc(capsys)["autoswitch"]["manualHoldUntil"] is None  # automatic
+        set_setting(root, "autoswitch.manualHoldSeconds", 0)
+        append_history(root, from_number=1, to_number=3, trigger="manual", at=now)
+        assert self._doc(capsys)["autoswitch"]["manualHoldUntil"] is None  # off
 
     def test_state_only_last_switch_from_older_engine(self, fleet, capsys):
         now = time.time()

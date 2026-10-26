@@ -56,6 +56,11 @@ class AutoSwitchSettings:
     weekly_threshold: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
+    # After the user switches by hand (cswap switch, the side bar, the phone),
+    # the engine leaves that account alone this long, as in a cooldown: no
+    # proactive, consume-first, reserve-return or schedule move. Escapes
+    # (at-limit, policy-limit, failover) still leave at once. 0 = off.
+    manual_hold_seconds: float = 7200.0
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
@@ -149,6 +154,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
             help="Minimum seconds between proactive switches",
+        ),
+        SettingSpec(
+            "autoswitch", "manualHoldSeconds", "manual_hold_seconds", "float", 0.0, 86400.0,
+            help="After a manual switch, seconds before auto-switch may move away by choice (0: off)",
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,

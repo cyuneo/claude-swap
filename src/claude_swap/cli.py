@@ -944,6 +944,24 @@ def _policy_view(switcher: ClaudeAccountSwitcher) -> tuple[list[dict], dict]:
     if isinstance(state_at, (int, float)):
         end = state_at + settings.cooldown_seconds
         cooldown_until = end if end > now else None
+    # The engine's hold after the user's own switch onto the active account
+    # (AutoSwitchEngine._manual_hold_until): additive manualHoldUntil.
+    manual_hold_until = None
+    active_number = next(
+        (str(a.number) for a in snapshot.accounts if a.is_active and a.number is not None),
+        None,
+    )
+    newest = history[0] if history else None
+    if (
+        newest is not None
+        and newest.get("trigger") == "manual"
+        and isinstance(newest.get("at"), (int, float))
+        and settings.manual_hold_seconds > 0
+        and newest.get("to") is not None
+        and newest.get("to") == active_number
+    ):
+        end = newest["at"] + settings.manual_hold_seconds
+        manual_hold_until = end if end > now else None
 
     service = read_status(root)
     if service is not None:
@@ -972,6 +990,8 @@ def _policy_view(switcher: ClaudeAccountSwitcher) -> tuple[list[dict], dict]:
         "settingsMtime": settings_mtime,
         "lastSwitch": last_switch,
         "cooldownUntil": cooldown_until,
+        "manualHoldUntil": manual_hold_until,
+        "manualHoldSeconds": settings.manual_hold_seconds,
         "nextCandidate": next_candidate,
         "excluded": excluded,
         "service": service,

@@ -335,6 +335,52 @@ class TestEnginePolicy:
         [sw] = _of(ph, SwitchEvent)
         assert sw.trigger == "reserve-return" and ph.active_number() == 1
 
+    # A manual switch is a choice the engine keeps for manualHoldSeconds:
+    # switched by hand onto the reserve, it is not handed straight back.
+    def _manual(self, ph, frm, to, ago=0.0):
+        from claude_swap.autoswitch_files import append_history
+
+        append_history(ph.switcher.backup_dir, from_number=frm, to_number=to,
+                       trigger="manual", at=ph.clock.now - ago)
+
+    def test_manual_switch_to_reserve_is_held(self, ph):
+        ph.make_live("c@example.com", 3)
+        self._manual(ph, 1, 3)
+        assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
+            is TickOutcome.NO_ACTION
+        hold = _of(ph, NoSwitchEvent)[-1]
+        assert hold.reason == "manual-hold" and "#3" in hold.detail
+        assert not _of(ph, SwitchEvent)
+
+    def test_manual_hold_ends_after_its_time(self, ph):
+        ph.make_live("c@example.com", 3)
+        self._manual(ph, 1, 3, ago=ph.engine.settings.manual_hold_seconds + 1)
+        assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
+            is TickOutcome.SWITCHED
+        assert _of(ph, SwitchEvent)[-1].trigger == "reserve-return"
+
+    def test_manual_hold_does_not_block_a_personal_limit(self, ph):
+        ph.make_live("c@example.com", 3)
+        self._manual(ph, 1, 3)
+        ph.tick_with_usage({"1": _u(10), "2": _u(10), "3": _u(25)})
+        [sw] = _of(ph, SwitchEvent)
+        assert sw.trigger == "policy-limit" and ph.active_number() != 3
+
+    def test_manual_hold_is_only_for_the_account_switched_to(self, ph):
+        ph.make_live("c@example.com", 3)
+        self._manual(ph, 3, 2)  # newest manual switch went elsewhere
+        assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
+            is TickOutcome.SWITCHED
+
+    def test_manual_hold_off_with_zero(self, ph):
+        from dataclasses import replace
+
+        ph.engine.settings = replace(ph.engine.settings, manual_hold_seconds=0.0)
+        ph.make_live("c@example.com", 3)
+        self._manual(ph, 1, 3)
+        assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
+            is TickOutcome.SWITCHED
+
     def test_reserve_holds_while_normals_blocked_or_in_cooldown(self, ph):
         ph.make_live("c@example.com", 3)
         assert ph.tick_with_usage({"1": _u(90), "2": _u(30), "3": _u(5)}) \

@@ -60,7 +60,9 @@ from claude_swap.account_policy import (
     load_policies,
 )
 from claude_swap.autoswitch_files import (
+    MANUAL_TRIGGER,
     STATUS_SCHEMA_VERSION,
+    read_history,
     redact_emails,
     write_status,
 )
@@ -1828,6 +1830,9 @@ class AutoSwitchEngine:
         if trigger in _COOLDOWN_TRIGGERS and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
+        if trigger in _COOLDOWN_TRIGGERS and self._manual_hold_until(current):
+            self._emit_manual_hold(current)
+            return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
         candidates = [
@@ -3153,6 +3158,11 @@ class AutoSwitchEngine:
             if trigger in _COOLDOWN_TRIGGERS and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
+            # The user may have switched by hand since this tick decided.
+            held = self.switcher.current_account_number()
+            if trigger in _COOLDOWN_TRIGGERS and held and self._manual_hold_until(held):
+                self._emit_manual_hold(held)
+                return TickOutcome.NO_ACTION
 
             # The switcher's switch path records the history line and starts
             # onSwitchCommand (once) with this trigger and this tick's
@@ -3231,6 +3241,37 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _manual_hold_until(self, current) -> float | None:
+        """When the newest switch was the user's own onto ``current``, the
+        end of its hold (``manual_hold_seconds``) while that is still ahead;
+        else None. A later automatic switch is newer, so it ends the hold."""
+        hold = self.settings.manual_hold_seconds
+        if not hold or hold <= 0:
+            return None
+        newest = read_history(self.switcher.backup_dir, limit=1)
+        if not newest:
+            return None
+        entry = newest[0]
+        at = entry.get("at")
+        if (
+            entry.get("trigger") != MANUAL_TRIGGER
+            or entry.get("to") != str(current)
+            or not isinstance(at, (int, float))
+        ):
+            return None
+        end = at + hold
+        return end if end > self.clock() else None
+
+    def _emit_manual_hold(self, current) -> None:
+        end = self._manual_hold_until(current)
+        stamp = time.strftime("%H:%M", time.localtime(end)) if end else "?"
+        self._emit(
+            NoSwitchEvent(
+                reason="manual-hold",
+                detail=f"switched by hand; staying on #{current} until {stamp}",
+            )
+        )
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]
