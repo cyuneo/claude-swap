@@ -350,6 +350,15 @@ class TestEnginePolicy:
         assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
             is TickOutcome.SWITCHED
 
+    def test_a_tool_borrowing_and_returning_keeps_the_users_hold(self, ph):
+        ph.make_live("c@example.com", 3)
+        self._manual(ph, 1, 3, ago=600)  # the user's own switch
+        self._manual(ph, 3, 2, ago=300, hold=False)  # api-worker borrows #2...
+        self._manual(ph, 2, 3, ago=200, hold=False)  # ...and switches back
+        assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
+            is TickOutcome.NO_ACTION
+        assert _of(ph, NoSwitchEvent)[-1].reason == "manual-hold"
+
     def test_switch_to_records_no_hold(self, ph):
         from claude_swap.autoswitch_files import read_history
 

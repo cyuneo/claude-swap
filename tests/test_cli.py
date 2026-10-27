@@ -943,6 +943,15 @@ class TestSubcommandAliases:
             "2", json_output=False, force=False, hold=False
         )
 
+    def test_no_hold_needs_a_target(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "switch", "--no-hold"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None), \
+             pytest.raises(SystemExit) as e:
+            cli.main()
+        assert e.value.code == 2
+        assert "--no-hold can only be used" in capsys.readouterr().err
+
     def test_bare_switch_subcommand_dispatches_switch(self):
         """`cswap switch` reaches switch() (rotate)."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \

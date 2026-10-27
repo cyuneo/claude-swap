@@ -79,17 +79,21 @@ def _num(value) -> str | None:
 HOLD_CLOCK_SKEW = 300.0  # seconds a history time stamp may be ahead of now
 
 
-def manual_hold_end(entry: dict | None, active, hold_seconds, now: float) -> float | None:
-    """When history ``entry`` (the newest) is the user's own switch onto
-    ``active``, the end of its hold while that is still ahead; else None.
+def manual_hold_end(history: list[dict], active, hold_seconds, now: float) -> float | None:
+    """When the newest switch in ``history`` (newest first) is the user's own
+    onto ``active``, the end of its hold while that is still ahead; else
+    None. Switches made with ``hold=False`` (a tool borrowing an account and
+    switching back) are passed over: they neither start nor end a hold.
     A time stamp well ahead of ``now`` (written by a clock that was wrong)
     starts no hold: trusted, it would hold for as long as the clock was off."""
-    if not entry or not hold_seconds or hold_seconds <= 0 or active is None:
+    if not hold_seconds or hold_seconds <= 0 or active is None:
+        return None
+    entry = next((e for e in history if e.get("hold") is not False), None)
+    if entry is None:
         return None
     at = entry.get("at")
     if (
         entry.get("trigger") != MANUAL_TRIGGER
-        or entry.get("hold") is False
         or entry.get("to") != str(active)
         or isinstance(at, bool)
         or not isinstance(at, (int, float))

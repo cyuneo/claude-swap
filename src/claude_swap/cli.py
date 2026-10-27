@@ -956,7 +956,7 @@ def _policy_view(switcher: ClaudeAccountSwitcher) -> tuple[list[dict], dict]:
         None,
     )
     manual_hold_until = manual_hold_end(
-        history[0] if history else None, active_number, settings.manual_hold_seconds, now
+        history, active_number, settings.manual_hold_seconds, now
     )
 
     service = read_status(root)
@@ -1750,9 +1750,7 @@ class QuietRepeats:
     """The human `cswap auto` log, quieter: a routine line (the usage poll,
     "no switch", the sleep) that says exactly what the last one of its kind
     said is left out, except once every ``every`` seconds as a heartbeat.
-    Switches, errors and anything that changed always print, and the routine
-    lines after one of them print again (they say how things stand now);
-    --json is never filtered."""
+    Switches, errors and limit lines always print; --json is never filtered."""
 
     QUIET_KINDS = frozenset(("poll", "no-switch", "sleep"))
 
@@ -1762,11 +1760,24 @@ class QuietRepeats:
         self.every = every
         self.clock = clock or time.monotonic
         self._last: dict[str, tuple[str, float]] = {}
+        self._loud: tuple[str, str] | None = None  # the last other line
+        self._loud_this_tick = False
 
     def should_print(self, kind: str, text: str) -> bool:
+        # The routine lines print again once things change: another switch,
+        # error or limit line than the last one, or a tick without any after
+        # one (it is over). The same line every tick changes nothing.
         if kind not in self.QUIET_KINDS:
-            self._last.clear()
+            if (kind, text) != self._loud:
+                self._last.clear()
+            self._loud = (kind, text)
+            self._loud_this_tick = True
             return True
+        if kind == "sleep":  # ends a tick
+            if not self._loud_this_tick and self._loud is not None:
+                self._loud = None
+                self._last.clear()
+            self._loud_this_tick = False
         now = self.clock()
         last = self._last.get(kind)
         if last is not None and last[0] == text and now - last[1] < self.every:
@@ -2159,6 +2170,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
+
+    if args.no_hold and not args.switch_to:
+        parser.error("--no-hold can only be used with 'switch <num|email>'")
 
     if args.model is not None and args.strategy is None:
         # Meaningless on a direct-target switch or plain rotation — nothing

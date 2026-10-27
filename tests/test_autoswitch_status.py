@@ -545,6 +545,21 @@ class TestCliSurface:
 class TestQuietRepeats:
     """The human `cswap auto` log leaves out a routine line that repeats."""
 
+    def test_a_loud_line_every_tick_keeps_the_routine_lines_quiet(self):
+        from claude_swap.cli import QuietRepeats
+
+        q = QuietRepeats(clock=lambda: 0.0)
+        tick = lambda loud: [q.should_print(k, t) for k, t in
+                             [("poll", "p"), *loud, ("no-switch", "n"), ("sleep", "s")]]
+        exhausted = [("policy-exhausted", "all at their limits")]
+        assert tick(exhausted) == [True] * 4
+        assert tick(exhausted) == [True, True, False, False]  # the poll came before the new line
+        assert tick(exhausted) == [False, True, False, False]
+        # it is over: the sleep line says so, and the next tick shows how things stand
+        assert tick([]) == [False, False, True]
+        assert tick([]) == [True, True, False]
+        assert tick([]) == [False, False, False]
+
     def test_repeats_are_dropped_until_the_heartbeat(self):
         from claude_swap.cli import QuietRepeats
 

@@ -347,6 +347,8 @@ def _below_line_detail(
 
 
 _UNSET = object()  # not set yet
+# How far back a manual hold is looked for past tools' hold=False switches
+HOLD_HISTORY_LINES = 20
 
 
 @dataclass(frozen=True)
@@ -3265,10 +3267,10 @@ class AutoSwitchEngine:
         hold = self.settings.manual_hold_seconds
         if not hold or hold <= 0:
             return None
-        newest = read_history(self.switcher.backup_dir, limit=1)
-        if not newest:
+        history = read_history(self.switcher.backup_dir, limit=HOLD_HISTORY_LINES)
+        if not history:
             return None
-        return manual_hold_end(newest[0], current, hold, self.clock())
+        return manual_hold_end(history, current, hold, self.clock())
 
     def _emit_manual_hold(self, current) -> None:
         end = self._manual_hold_until(current)
