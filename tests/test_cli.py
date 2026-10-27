@@ -309,7 +309,7 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=True
+            "2", json_output=False, force=True, hold=True
         )
 
     def test_switch_to_without_force_forwards_false(self):
@@ -321,7 +321,7 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, hold=True
         )
 
     def test_export_and_import_are_mutually_exclusive(self):
@@ -930,7 +930,17 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, hold=True
+        )
+
+    def test_switch_no_hold_is_forwarded(self):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "switch", "2", "--no-hold"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        switcher_cls.return_value.switch_to.assert_called_once_with(
+            "2", json_output=False, force=False, hold=False
         )
 
     def test_bare_switch_subcommand_dispatches_switch(self):

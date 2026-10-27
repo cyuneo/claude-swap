@@ -60,8 +60,8 @@ from claude_swap.account_policy import (
     load_policies,
 )
 from claude_swap.autoswitch_files import (
-    MANUAL_TRIGGER,
     STATUS_SCHEMA_VERSION,
+    manual_hold_end,
     read_history,
     redact_emails,
     write_status,
@@ -344,6 +344,9 @@ def _below_line_detail(
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
+
+
+_UNSET = object()  # not set yet
 
 
 @dataclass(frozen=True)
@@ -953,6 +956,8 @@ class AutoSwitchEngine:
         self._wake = threading.Event()
         self._unhealthy_ticks = 0
         self._health_account: str | None = None
+        # The active account this tick decided from (_perform rechecks it).
+        self._tick_current: object = _UNSET
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
         # longer than the normal interval.
@@ -1561,6 +1566,7 @@ class AutoSwitchEngine:
         )
 
         current = self.switcher.current_account_number()
+        self._tick_current = current
         # A tick with no managed active account keeps the current context;
         # a different account reseeds from the state file so its counts are
         # never inherited from the previous one.
@@ -3158,8 +3164,18 @@ class AutoSwitchEngine:
             if trigger in _COOLDOWN_TRIGGERS and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
-            # The user may have switched by hand since this tick decided.
+            # The user may have switched by hand since this tick decided:
+            # its choice was made for another account, so drop it (any
+            # trigger; the next tick decides again).
             held = self.switcher.current_account_number()
+            if self._tick_current is not _UNSET and held != self._tick_current:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="active-changed",
+                        detail=f"active account changed to #{held} during this tick",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if trigger in _COOLDOWN_TRIGGERS and held and self._manual_hold_until(held):
                 self._emit_manual_hold(held)
                 return TickOutcome.NO_ACTION
@@ -3252,16 +3268,7 @@ class AutoSwitchEngine:
         newest = read_history(self.switcher.backup_dir, limit=1)
         if not newest:
             return None
-        entry = newest[0]
-        at = entry.get("at")
-        if (
-            entry.get("trigger") != MANUAL_TRIGGER
-            or entry.get("to") != str(current)
-            or not isinstance(at, (int, float))
-        ):
-            return None
-        end = at + hold
-        return end if end > self.clock() else None
+        return manual_hold_end(newest[0], current, hold, self.clock())
 
     def _emit_manual_hold(self, current) -> None:
         end = self._manual_hold_until(current)

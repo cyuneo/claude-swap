@@ -76,6 +76,31 @@ def _num(value) -> str | None:
     return str(value)
 
 
+HOLD_CLOCK_SKEW = 300.0  # seconds a history time stamp may be ahead of now
+
+
+def manual_hold_end(entry: dict | None, active, hold_seconds, now: float) -> float | None:
+    """When history ``entry`` (the newest) is the user's own switch onto
+    ``active``, the end of its hold while that is still ahead; else None.
+    A time stamp well ahead of ``now`` (written by a clock that was wrong)
+    starts no hold: trusted, it would hold for as long as the clock was off."""
+    if not entry or not hold_seconds or hold_seconds <= 0 or active is None:
+        return None
+    at = entry.get("at")
+    if (
+        entry.get("trigger") != MANUAL_TRIGGER
+        or entry.get("hold") is False
+        or entry.get("to") != str(active)
+        or isinstance(at, bool)
+        or not isinstance(at, (int, float))
+    ):
+        return None
+    if at > now + HOLD_CLOCK_SKEW:
+        return None
+    end = at + hold_seconds
+    return end if end > now else None
+
+
 def append_history(
     root: Path,
     *,
@@ -83,9 +108,12 @@ def append_history(
     to_number,
     trigger: str,
     at: float | None = None,
+    hold: bool = True,
 ) -> dict:
     """Append one switch to the history file, keeping the newest
-    ``HISTORY_MAX_LINES`` lines. Returns the entry written."""
+    ``HISTORY_MAX_LINES`` lines. Returns the entry written. ``hold=False``
+    marks a manual switch that is not the user's choice of account (a tool
+    switching back), so it starts no manual hold."""
     entry = {
         "at": time.time() if at is None else at,
         "from": _num(from_number),
@@ -93,6 +121,8 @@ def append_history(
         "trigger": trigger,
         "auto": trigger != MANUAL_TRIGGER,
     }
+    if not hold:
+        entry["hold"] = False
     path = history_path(root)
     with FileLock(root / ".autoswitch_history.lock"):
         try:
@@ -125,13 +155,16 @@ def read_history(root: Path, limit: int = 20) -> list[dict]:
             continue
         if not isinstance(item, dict):
             continue
-        out.append({
+        entry = {
             "at": item.get("at"),
             "from": _num(item.get("from")),
             "to": _num(item.get("to")),
             "trigger": item.get("trigger"),
             "auto": bool(item.get("auto")),
-        })
+        }
+        if item.get("hold") is False:
+            entry["hold"] = False
+        out.append(entry)
     return out
 
 

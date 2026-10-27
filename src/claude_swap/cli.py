@@ -716,7 +716,12 @@ def _policy_view(switcher: ClaudeAccountSwitcher) -> tuple[list[dict], dict]:
         _headroom_by_account,
         escape_candidate,
     )
-    from claude_swap.autoswitch_files import read_history, read_status, redact_emails
+    from claude_swap.autoswitch_files import (
+        manual_hold_end,
+        read_history,
+        read_status,
+        redact_emails,
+    )
     from claude_swap.poll_policy import parse_reset_ts
     from claude_swap.settings import (
         load_settings,
@@ -946,22 +951,13 @@ def _policy_view(switcher: ClaudeAccountSwitcher) -> tuple[list[dict], dict]:
         cooldown_until = end if end > now else None
     # The engine's hold after the user's own switch onto the active account
     # (AutoSwitchEngine._manual_hold_until): additive manualHoldUntil.
-    manual_hold_until = None
     active_number = next(
         (str(a.number) for a in snapshot.accounts if a.is_active and a.number is not None),
         None,
     )
-    newest = history[0] if history else None
-    if (
-        newest is not None
-        and newest.get("trigger") == "manual"
-        and isinstance(newest.get("at"), (int, float))
-        and settings.manual_hold_seconds > 0
-        and newest.get("to") is not None
-        and newest.get("to") == active_number
-    ):
-        end = newest["at"] + settings.manual_hold_seconds
-        manual_hold_until = end if end > now else None
+    manual_hold_until = manual_hold_end(
+        history[0] if history else None, active_number, settings.manual_hold_seconds, now
+    )
 
     service = read_status(root)
     if service is not None:
@@ -1754,8 +1750,9 @@ class QuietRepeats:
     """The human `cswap auto` log, quieter: a routine line (the usage poll,
     "no switch", the sleep) that says exactly what the last one of its kind
     said is left out, except once every ``every`` seconds as a heartbeat.
-    Switches, errors and anything that changed always print; --json is never
-    filtered."""
+    Switches, errors and anything that changed always print, and the routine
+    lines after one of them print again (they say how things stand now);
+    --json is never filtered."""
 
     QUIET_KINDS = frozenset(("poll", "no-switch", "sleep"))
 
@@ -1768,6 +1765,7 @@ class QuietRepeats:
 
     def should_print(self, kind: str, text: str) -> bool:
         if kind not in self.QUIET_KINDS:
+            self._last.clear()
             return True
         now = self.clock()
         last = self._last.get(kind)
@@ -1979,6 +1977,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "Overwrite existing accounts during import; with 'switch <num|email>', "
             "activate the stored credentials without backing up the current "
             "login first"
+        ),
+    )
+    parser.add_argument(
+        "--no-hold",
+        action="store_true",
+        help=(
+            "With 'switch <num|email>': do not start the manual hold that keeps "
+            "cswap auto on this account (for tools that switch back)"
         ),
     )
     parser.add_argument(
@@ -2264,7 +2270,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
+                args.switch_to, json_output=args.json, force=args.force,
+                hold=not args.no_hold,
             )
         elif args.status:
             payload = switcher.status(json_output=args.json)

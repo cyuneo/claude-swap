@@ -489,6 +489,10 @@ class TestPolicyListAutoswitch:
         assert self._doc(capsys)["autoswitch"]["manualHoldUntil"] is None  # #1 is not active
         append_history(root, from_number=1, to_number=3, trigger="reserve-return", at=now)
         assert self._doc(capsys)["autoswitch"]["manualHoldUntil"] is None  # automatic
+        append_history(root, from_number=1, to_number=3, trigger="manual", at=now, hold=False)
+        assert self._doc(capsys)["autoswitch"]["manualHoldUntil"] is None  # a tool switching back
+        append_history(root, from_number=1, to_number=3, trigger="manual", at=now + 86400)
+        assert self._doc(capsys)["autoswitch"]["manualHoldUntil"] is None  # a clock a day ahead
         set_setting(root, "autoswitch.manualHoldSeconds", 0)
         append_history(root, from_number=1, to_number=3, trigger="manual", at=now)
         assert self._doc(capsys)["autoswitch"]["manualHoldUntil"] is None  # off
@@ -563,6 +567,12 @@ class TestQuietRepeats:
         from claude_swap.cli import QuietRepeats
 
         q = QuietRepeats(clock=lambda: 0.0)
+        # after an error the routine lines print again: they show it is over
+        for kind, text in (("poll", "p"), ("no-switch", "n")):
+            assert q.should_print(kind, text)
+        assert q.should_print("error", "boom")
+        assert q.should_print("poll", "p") and q.should_print("no-switch", "n")
+        assert not q.should_print("poll", "p")
         for kind in ("switch", "error", "policy-limit"):
             assert q.should_print(kind, "same")
             assert q.should_print(kind, "same")

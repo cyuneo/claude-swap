@@ -337,11 +337,52 @@ class TestEnginePolicy:
 
     # A manual switch is a choice the engine keeps for manualHoldSeconds:
     # switched by hand onto the reserve, it is not handed straight back.
-    def _manual(self, ph, frm, to, ago=0.0):
+    def _manual(self, ph, frm, to, ago=0.0, hold=True):
         from claude_swap.autoswitch_files import append_history
 
         append_history(ph.switcher.backup_dir, from_number=frm, to_number=to,
-                       trigger="manual", at=ph.clock.now - ago)
+                       trigger="manual", at=ph.clock.now - ago, hold=hold)
+
+    def test_a_switch_back_without_hold_is_not_held(self, ph):
+        # api-worker / the relogin flow switching back: `cswap switch --no-hold`
+        ph.make_live("c@example.com", 3)
+        self._manual(ph, 1, 3, hold=False)
+        assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
+            is TickOutcome.SWITCHED
+
+    def test_switch_to_records_no_hold(self, ph):
+        from claude_swap.autoswitch_files import read_history
+
+        assert ph.switcher.switch_to("1", json_output=True, hold=False)["switched"]
+        assert read_history(ph.switcher.backup_dir, limit=1)[0]["hold"] is False
+        assert ph.switcher.switch_to("2", json_output=True)["switched"]
+        assert "hold" not in read_history(ph.switcher.backup_dir, limit=1)[0]
+
+    def test_a_future_time_stamp_starts_no_hold(self, ph):
+        ph.make_live("c@example.com", 3)
+        self._manual(ph, 1, 3, ago=-86400)  # written by a clock a day ahead
+        assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
+            is TickOutcome.SWITCHED
+
+    def test_a_little_clock_skew_still_holds(self, ph):
+        ph.make_live("c@example.com", 3)
+        self._manual(ph, 1, 3, ago=-60)
+        assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
+            is TickOutcome.NO_ACTION
+
+    def test_an_account_changed_during_the_tick_drops_its_decision(self, ph):
+        ph.make_live("c@example.com", 3)
+        perform = ph.engine._perform
+
+        def switched_meanwhile(*a, **k):
+            ph.make_live("b@example.com", 2)  # the user, by hand, without history
+            return perform(*a, **k)
+
+        ph.engine._perform = switched_meanwhile
+        assert ph.tick_with_usage({"1": _u(50), "2": _u(30), "3": _u(5)}) \
+            is TickOutcome.NO_ACTION
+        assert _of(ph, NoSwitchEvent)[-1].reason == "active-changed"
+        assert not _of(ph, SwitchEvent)
 
     def test_manual_switch_to_reserve_is_held(self, ph):
         ph.make_live("c@example.com", 3)

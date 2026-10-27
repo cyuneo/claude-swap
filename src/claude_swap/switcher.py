@@ -6455,11 +6455,14 @@ class ClaudeAccountSwitcher:
         *,
         trigger: str = MANUAL_TRIGGER,
         on_switch_command: object = _HOOK_FROM_SETTINGS,
+        hold: bool = True,
     ) -> dict | None:
         """Switch to specific account.
 
         ``trigger``/``on_switch_command`` are for the auto engine (see
         ``_perform_switch``); every other caller keeps the defaults.
+        ``hold=False`` (``cswap switch --no-hold``) records the switch as one
+        that starts no manual hold: a tool switching back, not a choice.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
@@ -6564,6 +6567,7 @@ class ClaudeAccountSwitcher:
             provenance=provenance,
             trigger=trigger,
             on_switch_command=on_switch_command,
+            hold=hold,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -6953,6 +6957,7 @@ class ClaudeAccountSwitcher:
         *,
         trigger: str = MANUAL_TRIGGER,
         on_switch_command: object = _HOOK_FROM_SETTINGS,
+        hold: bool = True,
     ) -> dict:
         """The one switch path every surface goes through (CLI, TUI,
         menubar, the auto engine). After a real switch — the live identity
@@ -6967,11 +6972,12 @@ class ClaudeAccountSwitcher:
             target_account, emit_output, force_activate, provenance
         )
         if op.get("from") != op.get("to"):
-            self._after_switch(op, trigger, on_switch_command, emit_output)
+            self._after_switch(op, trigger, on_switch_command, emit_output, hold)
         return op
 
     def _after_switch(
-        self, op: dict, trigger: str, on_switch_command: object, emit_output: bool
+        self, op: dict, trigger: str, on_switch_command: object, emit_output: bool,
+        hold: bool = True,
     ) -> None:
         src = op.get("from") or {}
         dst = op.get("to") or {}
@@ -6981,6 +6987,7 @@ class ClaudeAccountSwitcher:
                 from_number=src.get("number"),
                 to_number=dst.get("number"),
                 trigger=trigger,
+                hold=hold,
             )
         except Exception as e:  # history is a record, never a reason to fail
             self._logger.warning(f"Could not record switch history: {e!r}")
