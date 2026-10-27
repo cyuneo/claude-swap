@@ -1,5 +1,7 @@
 # claude-swap
 
+> A modified fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap) by Onur Cetinkol (MIT License, kept in [LICENSE](LICENSE)), maintained as part of [cswap-suite](https://github.com/cyuneo/cswap-suite). Not affiliated with Anthropic.
+
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
 ## Installation
